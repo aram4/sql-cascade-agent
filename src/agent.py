@@ -36,6 +36,8 @@ class AgentState(BaseModel):
     done: bool = False
     answer: str = ""
     history: List[dict] = []
+    use_sandbox: bool = False
+    summarize: bool = True
 
 
 def get_llm(model: str = DEFAULT_MODEL) -> ChatFireworks:
@@ -134,6 +136,12 @@ def generate_sql(state: AgentState) -> dict:
 
 
 def execute_sql(state: AgentState) -> dict:
+    if state.use_sandbox:
+        return _execute_sql_modal(state)
+    return _execute_sql_local(state)
+
+
+def _execute_sql_local(state: AgentState) -> dict:
     try:
         conn = sqlite3.connect(state.db_path)
         cursor = conn.cursor()
@@ -142,6 +150,21 @@ def execute_sql(state: AgentState) -> dict:
         columns = [desc[0] for desc in cursor.description] if cursor.description else []
         conn.close()
         return {"result": {"columns": columns, "rows": rows}, "error": ""}
+    except Exception as e:
+        return {"result": None, "error": str(e)}
+
+
+def _execute_sql_modal(state: AgentState) -> dict:
+    from src.sandbox import run_sandboxed
+
+    try:
+        with open(state.db_path, "rb") as f:
+            db_bytes = f.read()
+        result = run_sandboxed(db_bytes, state.sql)
+        error = result.get("error", "")
+        if error:
+            return {"result": None, "error": error}
+        return {"result": {"columns": result["columns"], "rows": result["rows"]}, "error": ""}
     except Exception as e:
         return {"result": None, "error": str(e)}
 
@@ -175,7 +198,9 @@ def check_result(state: AgentState) -> dict:
 
 def should_retry(state: AgentState) -> str:
     if state.done:
-        return "summarize_result"
+        if state.summarize:
+            return "summarize_result"
+        return END
     return "generate_sql"
 
 
@@ -198,13 +223,19 @@ def build_graph() -> StateGraph:
     return graph.compile()
 
 
-def run_question(question: str, db_path: str, history: List[dict] = None, model: str = DEFAULT_MODEL) -> dict:
+def run_question(question: str, db_path: str, history: List[dict] = None, model: str = DEFAULT_MODEL, use_sandbox: bool = False, summarize: bool = True) -> dict:
     global DEFAULT_MODEL
     original = DEFAULT_MODEL
     DEFAULT_MODEL = model
 
     graph = build_graph()
-    initial_state = AgentState(question=question, db_path=db_path, history=history or [])
+    initial_state = AgentState(
+        question=question,
+        db_path=db_path,
+        history=history or [],
+        use_sandbox=use_sandbox,
+        summarize=summarize,
+    )
     final_state = graph.invoke(initial_state)
 
     DEFAULT_MODEL = original
