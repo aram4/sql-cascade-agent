@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -16,6 +16,8 @@ load_dotenv()
 
 MAX_RETRIES = 2
 DEFAULT_MODEL = "accounts/fireworks/models/deepseek-v4-flash-0731"
+
+_schema_cache: dict[str, str] = {}
 
 
 class SQLOutput(BaseModel):
@@ -33,6 +35,7 @@ class AgentState(BaseModel):
     retries: int = 0
     done: bool = False
     answer: str = ""
+    history: List[dict] = []
 
 
 def get_llm(model: str = DEFAULT_MODEL) -> ChatFireworks:
@@ -45,6 +48,9 @@ def get_llm(model: str = DEFAULT_MODEL) -> ChatFireworks:
 
 
 def retrieve_schema(state: AgentState) -> dict:
+    if state.db_path in _schema_cache:
+        return {"schema": _schema_cache[state.db_path]}
+
     conn = sqlite3.connect(state.db_path)
     cursor = conn.cursor()
 
@@ -77,7 +83,9 @@ def retrieve_schema(state: AgentState) -> dict:
         )
 
     conn.close()
-    return {"schema": "\n\n".join(schema_parts)}
+    schema = "\n\n".join(schema_parts)
+    _schema_cache[state.db_path] = schema
+    return {"schema": schema}
 
 
 def generate_sql(state: AgentState) -> dict:
@@ -92,6 +100,14 @@ def generate_sql(state: AgentState) -> dict:
             f"Fix the query based on this error."
         )
 
+    history_context = ""
+    if state.history:
+        turns = "\n".join(
+            f"Q: {h['question']}\nSQL: {h['sql']}\nAnswer: {h['answer']}"
+            for h in state.history
+        )
+        history_context = f"\n\nConversation so far:\n{turns}\n\nUse this context to resolve references like 'they', 'those', 'that department', etc."
+
     messages = [
         SystemMessage(content=(
             "You are a SQL expert. Given a database schema and a question, "
@@ -101,10 +117,12 @@ def generate_sql(state: AgentState) -> dict:
             "- Use SQLite syntax\n"
             "- Return only the data requested, no extra columns\n"
             "- Use JOINs when data spans multiple tables\n"
+            "- Use COLLATE NOCASE or LOWER() for string comparisons to handle case differences\n"
         )),
         HumanMessage(content=(
             f"Schema:\n{state.schema}\n\n"
             f"Question: {state.question}"
+            f"{history_context}"
             f"{error_context}"
         )),
     ]
@@ -138,7 +156,7 @@ def summarize_result(state: AgentState) -> dict:
     formatted = "\n".join(str(dict(zip(columns, row))) for row in rows)
 
     messages = [
-        SystemMessage(content="You answer questions in plain English based on SQL query results. Be concise and direct."),
+        SystemMessage(content="You answer questions in plain English based on SQL query results. Be concise and direct. Don't forget that data will be uppercased in SQL"),
         HumanMessage(content=(
             f"Question: {state.question}\n\n"
             f"SQL Result:\n{formatted}\n\n"
@@ -180,13 +198,13 @@ def build_graph() -> StateGraph:
     return graph.compile()
 
 
-def run_question(question: str, db_path: str, model: str = DEFAULT_MODEL) -> dict:
+def run_question(question: str, db_path: str, history: List[dict] = None, model: str = DEFAULT_MODEL) -> dict:
     global DEFAULT_MODEL
     original = DEFAULT_MODEL
     DEFAULT_MODEL = model
 
     graph = build_graph()
-    initial_state = AgentState(question=question, db_path=db_path)
+    initial_state = AgentState(question=question, db_path=db_path, history=history or [])
     final_state = graph.invoke(initial_state)
 
     DEFAULT_MODEL = original

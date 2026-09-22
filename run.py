@@ -1,4 +1,4 @@
-"""Run a single question through the text-to-SQL agent."""
+"""Interactive text-to-SQL agent — ask follow-up questions in terminal."""
 
 import json
 import sys
@@ -14,21 +14,37 @@ def main():
     if not os.path.exists(DB_PATH):
         create()
 
-    question = "What are the names of employees in the Engineering department were hired before 2023?"
-
-    print(f"Question: {question}")
     print(f"Database: {DB_PATH}")
+    print("Type your question (or 'quit' to exit)")
     print("-" * 60)
 
-    result = run_question(question=question, db_path=DB_PATH)
+    history = []
 
-    print(f"Generated SQL: {result['sql']}")
-    print(f"Retries: {result['retries']}")
-    if result["error"]:
-        print(f"Error: {result['error']}")
-    else:
-        print(f"Result: {json.dumps(result['result'], indent=2)}")
-    print(f"\nAnswer: {result['answer']}")
+    while True:
+        try:
+            question = input("\n> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nBye!")
+            break
+
+        if not question:
+            continue
+        if question.lower() in ("quit", "exit", "q"):
+            print("Bye!")
+            break
+
+        result = run_question(question=question, db_path=DB_PATH, history=history)
+
+        print(f"SQL: {result['sql']}")
+        if result["error"]:
+            print(f"Error: {result['error']}")
+        print(f"Answer: {result['answer']}")
+
+        history.append({
+            "question": question,
+            "sql": result["sql"],
+            "answer": result["answer"],
+        })
 
 
 if __name__ == "__main__":
