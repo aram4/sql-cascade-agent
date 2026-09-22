@@ -14,7 +14,7 @@ def main():
     if not os.path.exists(DB_PATH):
         create()
 
-    question = "What are the names of employees in the Engineering department who earn more than 100000?"
+    question = "What are the names of employees in the Engineering department were hired before 2023?"
 
     print(f"Question: {question}")
     print(f"Database: {DB_PATH}")
@@ -28,6 +28,7 @@ def main():
         print(f"Error: {result['error']}")
     else:
         print(f"Result: {json.dumps(result['result'], indent=2)}")
+    print(f"\nAnswer: {result['answer']}")
 
 
 if __name__ == "__main__":

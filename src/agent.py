@@ -32,6 +32,7 @@ class AgentState(BaseModel):
     error: str = ""
     retries: int = 0
     done: bool = False
+    answer: str = ""
 
 
 def get_llm(model: str = DEFAULT_MODEL) -> ChatFireworks:
@@ -127,6 +128,27 @@ def execute_sql(state: AgentState) -> dict:
         return {"result": None, "error": str(e)}
 
 
+def summarize_result(state: AgentState) -> dict:
+    if state.error or not state.result:
+        return {"answer": f"Sorry, I couldn't answer that. Error: {state.error}"}
+
+    llm = get_llm()
+    rows = state.result["rows"]
+    columns = state.result["columns"]
+    formatted = "\n".join(str(dict(zip(columns, row))) for row in rows)
+
+    messages = [
+        SystemMessage(content="You answer questions in plain English based on SQL query results. Be concise and direct."),
+        HumanMessage(content=(
+            f"Question: {state.question}\n\n"
+            f"SQL Result:\n{formatted}\n\n"
+            f"Answer the question in a natural sentence."
+        )),
+    ]
+    response = llm.invoke(messages)
+    return {"answer": response.content}
+
+
 def check_result(state: AgentState) -> dict:
     if state.error and state.retries < MAX_RETRIES:
         return {"retries": state.retries + 1}
@@ -135,7 +157,7 @@ def check_result(state: AgentState) -> dict:
 
 def should_retry(state: AgentState) -> str:
     if state.done:
-        return END
+        return "summarize_result"
     return "generate_sql"
 
 
@@ -146,12 +168,14 @@ def build_graph() -> StateGraph:
     graph.add_node("generate_sql", generate_sql)
     graph.add_node("execute_sql", execute_sql)
     graph.add_node("check_result", check_result)
+    graph.add_node("summarize_result", summarize_result)
 
     graph.set_entry_point("retrieve_schema")
     graph.add_edge("retrieve_schema", "generate_sql")
     graph.add_edge("generate_sql", "execute_sql")
     graph.add_edge("execute_sql", "check_result")
     graph.add_conditional_edges("check_result", should_retry)
+    graph.add_edge("summarize_result", END)
 
     return graph.compile()
 
