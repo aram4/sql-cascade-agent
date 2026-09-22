@@ -26,12 +26,64 @@ def execute_gold_sql(db_path: str, sql: str) -> dict:
         return {"columns": [], "rows": [], "error": str(e)}
 
 
+FLOAT_TOLERANCE = 1e-6
+
+
+def _normalize_value(v):
+    """Normalize a single value for comparison."""
+    if v is None:
+        return None
+    if isinstance(v, float):
+        return round(v, 6)
+    if isinstance(v, str):
+        return v.strip().lower()
+    return v
+
+
+def _sort_key(v):
+    """Sort key that handles mixed types including None."""
+    if v is None:
+        return (0, "")
+    if isinstance(v, (int, float)):
+        return (1, v)
+    return (2, str(v))
+
+
+def _normalize_row(row: tuple) -> tuple:
+    """Normalize a row: sort values to handle column-order independence."""
+    return tuple(sorted((_normalize_value(v) for v in row), key=_sort_key))
+
+
 def results_match(generated: dict, gold: dict) -> bool:
+    """Compare result sets: order-insensitive, column-order-independent,
+    NULL-aware, float-tolerant multiset comparison."""
     if not generated or not gold:
         return False
-    gen_rows = set(tuple(r) for r in generated.get("rows", []))
-    gold_rows = set(tuple(r) for r in gold.get("rows", []))
-    return gen_rows == gold_rows
+
+    gen_rows = generated.get("rows", [])
+    gold_rows = gold.get("rows", [])
+
+    if len(gen_rows) != len(gold_rows):
+        return False
+
+    gen_normalized = sorted(_normalize_row(tuple(r)) for r in gen_rows)
+    gold_normalized = sorted(_normalize_row(tuple(r)) for r in gold_rows)
+
+    for gen_row, gold_row in zip(gen_normalized, gold_normalized):
+        if len(gen_row) != len(gold_row):
+            return False
+        for gv, ev in zip(gen_row, gold_row):
+            if gv is None and ev is None:
+                continue
+            if gv is None or ev is None:
+                return False
+            if isinstance(gv, float) and isinstance(ev, float):
+                if abs(gv - ev) > FLOAT_TOLERANCE:
+                    return False
+            elif gv != ev:
+                return False
+
+    return True
 
 
 def run_eval(db_path: str, questions: list[dict], use_sandbox: bool = False, model: str = None) -> dict:

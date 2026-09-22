@@ -19,6 +19,12 @@ The agent runs the same LangGraph pipeline in two modes:
 
 The English answer is a presentation layer only. Eval accuracy is measured by comparing result sets (rows returned), never prose.
 
+## Eval methodology
+
+- **Scoring**: order-insensitive, column-order-independent multiset comparison. NULLs must match exactly. Floats compared within 1e-6 tolerance. Strings normalized to lowercase/trimmed.
+- **Temperature**: 0 (deterministic). Single pass per question, no k-run majority vote.
+- **Dataset**: targeting a 250-question stratified slice of BIRD dev set across difficulty levels. Current sample eval (n=15) is for harness validation only — not for model comparison claims.
+
 ## Stack
 
 - **LangGraph** — agent orchestration with typed state and bounded retry loops
