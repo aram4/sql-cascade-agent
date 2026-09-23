@@ -66,8 +66,11 @@ def results_match(generated: dict, gold: dict) -> bool:
     if len(gen_rows) != len(gold_rows):
         return False
 
-    gen_normalized = sorted(_normalize_row(tuple(r)) for r in gen_rows)
-    gold_normalized = sorted(_normalize_row(tuple(r)) for r in gold_rows)
+    def _row_sort_key(row):
+        return tuple(_sort_key(v) for v in row)
+
+    gen_normalized = sorted((_normalize_row(tuple(r)) for r in gen_rows), key=_row_sort_key)
+    gold_normalized = sorted((_normalize_row(tuple(r)) for r in gold_rows), key=_row_sort_key)
 
     for gen_row, gold_row in zip(gen_normalized, gold_normalized):
         if len(gen_row) != len(gold_row):

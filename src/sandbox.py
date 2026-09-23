@@ -5,7 +5,7 @@ import modal
 app = modal.App("sql-sandbox")
 volume = modal.Volume.from_name("bird-databases", create_if_missing=True)
 
-QUERY_TIMEOUT = 30
+QUERY_TIMEOUT = 60
 
 
 @app.function(timeout=QUERY_TIMEOUT)
@@ -94,36 +94,40 @@ def get_schema_from_volume(db_id: str) -> str:
 
 
 class SandboxRunner:
-    """Keeps one Modal app alive for the duration of a session."""
+    """Calls deployed Modal functions — no ephemeral app context needed."""
 
     def __init__(self):
-        self._context = None
+        self._exec_sandboxed = None
+        self._exec_on_volume = None
+        self._get_schema = None
+
+    def _ensure_lookups(self):
+        if self._exec_on_volume is None:
+            self._exec_sandboxed = modal.Function.from_name("sql-sandbox", "execute_sql_sandboxed")
+            self._exec_on_volume = modal.Function.from_name("sql-sandbox", "execute_sql_on_volume")
+            self._get_schema = modal.Function.from_name("sql-sandbox", "get_schema_from_volume")
 
     def start(self):
-        if self._context is None:
-            self._context = app.run()
-            self._context.__enter__()
+        self._ensure_lookups()
 
     def stop(self):
-        if self._context is not None:
-            self._context.__exit__(None, None, None)
-            self._context = None
+        pass
 
     def run(self, db_bytes: bytes, sql: str) -> dict:
-        self.start()
-        return execute_sql_sandboxed.remote(db_bytes, sql)
+        self._ensure_lookups()
+        return self._exec_sandboxed.remote(db_bytes, sql)
 
     def run_on_volume(self, db_id: str, sql: str) -> dict:
-        self.start()
-        return execute_sql_on_volume.remote(db_id, sql)
+        self._ensure_lookups()
+        return self._exec_on_volume.remote(db_id, sql)
 
     def run_batch_on_volume(self, db_ids: list[str], queries: list[str]) -> list[dict]:
-        self.start()
-        return list(execute_sql_on_volume.map(db_ids, queries))
+        self._ensure_lookups()
+        return list(self._exec_on_volume.map(db_ids, queries))
 
     def get_schema(self, db_id: str) -> str:
-        self.start()
-        return get_schema_from_volume.remote(db_id)
+        self._ensure_lookups()
+        return self._get_schema.remote(db_id)
 
     def __enter__(self):
         self.start()

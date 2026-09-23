@@ -71,7 +71,12 @@ def run_with_retries(question: str, schema: str, db_id: str, runner, model: str 
             error = gen["error"]
             continue
 
-        result = runner.run_on_volume(db_id, sql)
+        try:
+            result = runner.run_on_volume(db_id, sql)
+        except Exception as e:
+            error = str(e)
+            result = {"columns": [], "rows": [], "error": error}
+            continue
         error = result.get("error", "")
         if not error:
             break
@@ -95,7 +100,10 @@ def run_bird_eval(questions: list[dict], model: str = None) -> dict:
             schema_cache[db_id] = runner.get_schema(db_id)
 
         agent = run_with_retries(q["question"], schema_cache[db_id], db_id, runner, model)
-        gold_result = runner.run_on_volume(db_id, q["SQL"])
+        try:
+            gold_result = runner.run_on_volume(db_id, q["SQL"])
+        except Exception as e:
+            gold_result = {"columns": [], "rows": [], "error": str(e)}
         latency = time.time() - start
 
         match = results_match(agent["result"], gold_result)
