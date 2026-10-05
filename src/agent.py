@@ -12,8 +12,11 @@ from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
 from src.model_router import get_llm_for_role, make_span
+from src.tracing import init_tracing, get_tracer
 
 load_dotenv()
+init_tracing()
+tracer = get_tracer()
 
 MAX_RETRIES = 2
 
@@ -55,44 +58,49 @@ def _usage_from_raw(raw) -> Optional[dict]:
 
 
 def retrieve_schema(state: AgentState) -> dict:
-    if state.db_path in _schema_cache:
-        return {"schema": _schema_cache[state.db_path]}
+    with tracer.start_as_current_span("retrieve_schema") as span:
+        span.set_attribute("db_path", state.db_path)
+        cache_hit = state.db_path in _schema_cache
+        span.set_attribute("cache_hit", cache_hit)
+        if cache_hit:
+            return {"schema": _schema_cache[state.db_path]}
 
-    conn = sqlite3.connect(state.db_path)
-    cursor = conn.cursor()
+        conn = sqlite3.connect(state.db_path)
+        cursor = conn.cursor()
 
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-    tables = [row[0] for row in cursor.fetchall()]
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+        tables = [row[0] for row in cursor.fetchall()]
+        span.set_attribute("table_count", len(tables))
 
-    schema_parts = []
-    for table in tables:
-        cursor.execute(f"PRAGMA table_info('{table}')")
-        columns = cursor.fetchall()
-        col_defs = [f"  {c[1]} {c[2]}{'  PRIMARY KEY' if c[5] else ''}" for c in columns]
+        schema_parts = []
+        for table in tables:
+            cursor.execute(f"PRAGMA table_info('{table}')")
+            columns = cursor.fetchall()
+            col_defs = [f"  {c[1]} {c[2]}{'  PRIMARY KEY' if c[5] else ''}" for c in columns]
 
-        cursor.execute(f"PRAGMA foreign_key_list('{table}')")
-        fks = cursor.fetchall()
-        fk_defs = [f"  FOREIGN KEY ({fk[3]}) REFERENCES {fk[2]}({fk[4]})" for fk in fks]
+            cursor.execute(f"PRAGMA foreign_key_list('{table}')")
+            fks = cursor.fetchall()
+            fk_defs = [f"  FOREIGN KEY ({fk[3]}) REFERENCES {fk[2]}({fk[4]})" for fk in fks]
 
-        cursor.execute(f"SELECT * FROM '{table}' LIMIT 3")
-        sample_rows = cursor.fetchall()
-        col_names = [desc[0] for desc in cursor.description]
-        sample_str = "\n".join(
-            "  " + str(dict(zip(col_names, row))) for row in sample_rows
-        )
+            cursor.execute(f"SELECT * FROM '{table}' LIMIT 3")
+            sample_rows = cursor.fetchall()
+            col_names = [desc[0] for desc in cursor.description]
+            sample_str = "\n".join(
+                "  " + str(dict(zip(col_names, row))) for row in sample_rows
+            )
 
-        schema_parts.append(
-            f"CREATE TABLE {table} (\n"
-            + ",\n".join(col_defs)
-            + ("\n" + ",\n".join(fk_defs) if fk_defs else "")
-            + "\n);\n"
-            + f"-- Sample rows:\n{sample_str}"
-        )
+            schema_parts.append(
+                f"CREATE TABLE {table} (\n"
+                + ",\n".join(col_defs)
+                + ("\n" + ",\n".join(fk_defs) if fk_defs else "")
+                + "\n);\n"
+                + f"-- Sample rows:\n{sample_str}"
+            )
 
-    conn.close()
-    schema = "\n\n".join(schema_parts)
-    _schema_cache[state.db_path] = schema
-    return {"schema": schema}
+        conn.close()
+        schema = "\n\n".join(schema_parts)
+        _schema_cache[state.db_path] = schema
+        return {"schema": schema}
 
 
 GENERATE_SYSTEM_PROMPT = (
@@ -118,20 +126,32 @@ def generate_sql_call(schema: str, question: str, extra_context: str = "", overr
     llm, resolution = get_llm_for_role("generate", override=override or None)
     start = time.perf_counter()
 
-    messages = [
-        SystemMessage(content=GENERATE_SYSTEM_PROMPT),
-        HumanMessage(content=f"Schema:\n{schema}\n\nQuestion: {question}{extra_context}"),
-    ]
+    with tracer.start_as_current_span("generate_sql") as otel_span:
+        otel_span.set_attribute("role", resolution.role)
+        otel_span.set_attribute("model", resolution.model)
+        otel_span.set_attribute("model_source", resolution.source)
+        otel_span.set_attribute("retries", retries)
 
-    structured_llm = llm.with_structured_output(SQLOutput, include_raw=True)
-    response = structured_llm.invoke(messages)
-    parsed = response["parsed"]
-    if parsed is None:
-        raise RuntimeError(
-            f"generate stage ({resolution.model}) returned unparseable output: {response.get('parsing_error')}"
-        )
+        messages = [
+            SystemMessage(content=GENERATE_SYSTEM_PROMPT),
+            HumanMessage(content=f"Schema:\n{schema}\n\nQuestion: {question}{extra_context}"),
+        ]
 
-    span = make_span(resolution, "generate_sql", start, _usage_from_raw(response["raw"]), retries=retries)
+        structured_llm = llm.with_structured_output(SQLOutput, include_raw=True)
+        response = structured_llm.invoke(messages)
+        parsed = response["parsed"]
+        if parsed is None:
+            otel_span.set_attribute("error", True)
+            raise RuntimeError(
+                f"generate stage ({resolution.model}) returned unparseable output: {response.get('parsing_error')}"
+            )
+
+        usage = _usage_from_raw(response["raw"])
+        if usage:
+            otel_span.set_attribute("input_tokens", usage.get("input_tokens") or 0)
+            otel_span.set_attribute("output_tokens", usage.get("output_tokens") or 0)
+
+    span = make_span(resolution, "generate_sql", start, usage, retries=retries)
     return parsed.sql, span
 
 
@@ -140,20 +160,33 @@ def validate_sql_call(schema: str, question: str, sql: str, retries: int = 0) ->
     llm, resolution = get_llm_for_role("validate")
     start = time.perf_counter()
 
-    messages = [
-        SystemMessage(content=VALIDATE_SYSTEM_PROMPT),
-        HumanMessage(content=f"Schema:\n{schema}\n\nQuestion: {question}\n\nCandidate SQL:\n{sql}"),
-    ]
+    with tracer.start_as_current_span("validate_sql") as otel_span:
+        otel_span.set_attribute("role", resolution.role)
+        otel_span.set_attribute("model", resolution.model)
+        otel_span.set_attribute("model_source", resolution.source)
+        otel_span.set_attribute("retries", retries)
 
-    structured_llm = llm.with_structured_output(ValidationOutput, include_raw=True)
-    response = structured_llm.invoke(messages)
-    parsed = response["parsed"]
-    if parsed is None:
-        raise RuntimeError(
-            f"validate stage ({resolution.model}) returned unparseable output: {response.get('parsing_error')}"
-        )
+        messages = [
+            SystemMessage(content=VALIDATE_SYSTEM_PROMPT),
+            HumanMessage(content=f"Schema:\n{schema}\n\nQuestion: {question}\n\nCandidate SQL:\n{sql}"),
+        ]
 
-    span = make_span(resolution, "validate_sql", start, _usage_from_raw(response["raw"]), retries=retries)
+        structured_llm = llm.with_structured_output(ValidationOutput, include_raw=True)
+        response = structured_llm.invoke(messages)
+        parsed = response["parsed"]
+        if parsed is None:
+            otel_span.set_attribute("error", True)
+            raise RuntimeError(
+                f"validate stage ({resolution.model}) returned unparseable output: {response.get('parsing_error')}"
+            )
+
+        usage = _usage_from_raw(response["raw"])
+        if usage:
+            otel_span.set_attribute("input_tokens", usage.get("input_tokens") or 0)
+            otel_span.set_attribute("output_tokens", usage.get("output_tokens") or 0)
+        otel_span.set_attribute("valid", parsed.valid)
+
+    span = make_span(resolution, "validate_sql", start, usage, retries=retries)
     return parsed.valid, parsed.reason, span
 
 
@@ -198,9 +231,12 @@ def route_after_validate(state: AgentState) -> str:
 
 
 def execute_sql(state: AgentState) -> dict:
-    if state.use_sandbox:
-        return _execute_sql_modal(state)
-    return _execute_sql_local(state)
+    with tracer.start_as_current_span("execute_sql") as span:
+        span.set_attribute("use_sandbox", state.use_sandbox)
+        span.set_attribute("sql", state.sql[:500])
+        result = _execute_sql_modal(state) if state.use_sandbox else _execute_sql_local(state)
+        span.set_attribute("error", bool(result.get("error")))
+        return result
 
 
 def _execute_sql_local(state: AgentState) -> dict:
@@ -237,20 +273,31 @@ def summarize_result(state: AgentState) -> dict:
 
     llm, resolution = get_llm_for_role("summarize")
     start = time.perf_counter()
-    rows = state.result["rows"]
-    columns = state.result["columns"]
-    formatted = "\n".join(str(dict(zip(columns, row))) for row in rows)
 
-    messages = [
-        SystemMessage(content="You answer questions in plain English based on SQL query results. Be concise and direct. Don't forget that data will be uppercased in SQL"),
-        HumanMessage(content=(
-            f"Question: {state.question}\n\n"
-            f"SQL Result:\n{formatted}\n\n"
-            f"Answer the question in a natural sentence."
-        )),
-    ]
-    response = llm.invoke(messages)
-    span = make_span(resolution, "summarize_result", start, _usage_from_raw(response))
+    with tracer.start_as_current_span("summarize_result") as otel_span:
+        otel_span.set_attribute("role", resolution.role)
+        otel_span.set_attribute("model", resolution.model)
+        otel_span.set_attribute("model_source", resolution.source)
+
+        rows = state.result["rows"]
+        columns = state.result["columns"]
+        formatted = "\n".join(str(dict(zip(columns, row))) for row in rows)
+
+        messages = [
+            SystemMessage(content="You answer questions in plain English based on SQL query results. Be concise and direct. Don't forget that data will be uppercased in SQL"),
+            HumanMessage(content=(
+                f"Question: {state.question}\n\n"
+                f"SQL Result:\n{formatted}\n\n"
+                f"Answer the question in a natural sentence."
+            )),
+        ]
+        response = llm.invoke(messages)
+        usage = _usage_from_raw(response)
+        if usage:
+            otel_span.set_attribute("input_tokens", usage.get("input_tokens") or 0)
+            otel_span.set_attribute("output_tokens", usage.get("output_tokens") or 0)
+
+    span = make_span(resolution, "summarize_result", start, usage)
     return {"answer": response.content, "trace": state.trace + [span]}
 
 
@@ -293,13 +340,18 @@ def run_question(question: str, db_path: str, history: List[dict] = None, model:
     """`model`, if given, overrides only the `generate` role's model for this call
     (the lever used to compare small vs. large generation models in evals).
     The `validate` and `summarize` roles always resolve from model_routes.json."""
-    graph = build_graph()
-    initial_state = AgentState(
-        question=question,
-        db_path=db_path,
-        history=history or [],
-        use_sandbox=use_sandbox,
-        summarize=summarize,
-        generate_model_override=model or "",
-    )
-    return graph.invoke(initial_state)
+    with tracer.start_as_current_span("run_question") as span:
+        span.set_attribute("question", question)
+        span.set_attribute("db_path", db_path)
+        span.set_attribute("use_sandbox", use_sandbox)
+
+        graph = build_graph()
+        initial_state = AgentState(
+            question=question,
+            db_path=db_path,
+            history=history or [],
+            use_sandbox=use_sandbox,
+            summarize=summarize,
+            generate_model_override=model or "",
+        )
+        return graph.invoke(initial_state)

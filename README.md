@@ -49,6 +49,20 @@ Routes:
 Token counts are from each provider's `usage_metadata`; converting to dollars just needs multiplying by your
 current Fireworks per-token rate for that model, which isn't hardcoded here since it changes over time.
 
+## Tracing
+
+Every stage (`retrieve_schema`, `generate_sql`, `validate_sql`, `execute_sql`, `summarize_result`), plus a
+`run_question` / `run_with_retries` root span wrapping all of them, emits a real OpenTelemetry span via
+`src/tracing.py` — trace IDs, span IDs, parent/child nesting through context propagation, and attributes
+(role, model, source, tokens, retries). It's wired to the console exporter, so spans print as JSON to
+stdout with no collector or backend to stand up. This is additive, not a replacement for the `routes`
+summary above: that still reads the lightweight `trace` dict on `AgentState`, which is structured data the
+eval harness can roll up — OTel here is for watching one request's actual call shape (what ran, in what
+order, how long each part took), not for the aggregate eval report.
+
+Swapping the exporter for a real backend later (Jaeger, Honeycomb, etc.) only touches `init_tracing()` in
+`src/tracing.py` — add an OTLP span processor there; nothing in `agent.py` or `eval_bird.py` changes.
+
 ## Two modes, one graph
 
 The agent runs the same LangGraph pipeline in two modes:
@@ -75,7 +89,7 @@ The English answer is a presentation layer only. Eval accuracy is measured by co
 ## Quick start
 
 ```bash
-pip install modal langgraph langchain-fireworks python-dotenv
+pip install modal langgraph langchain-fireworks python-dotenv opentelemetry-api opentelemetry-sdk
 python3 -m modal setup
 
 # Add your Fireworks API key

@@ -13,6 +13,9 @@ load_dotenv()
 from src.agent import generate_sql_call, validate_sql_call, MAX_RETRIES
 from src.sandbox import get_runner, shutdown_sandbox
 from src.eval import results_match, summarize_routes
+from src.tracing import get_tracer
+
+tracer = get_tracer()
 
 BIRD_SLICE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "bird", "bird_slice.json")
 
@@ -31,39 +34,48 @@ def run_with_retries(question: str, schema: str, db_id: str, runner, model: str 
     retries = 0
     trace: list[dict] = []
 
-    for attempt in range(MAX_RETRIES + 1):
-        if attempt > 0:
-            retries = attempt
+    with tracer.start_as_current_span("run_with_retries") as root_span:
+        root_span.set_attribute("question", question)
+        root_span.set_attribute("db_id", db_id)
 
-        extra_context = (
-            "" if attempt == 0
-            else f"\n\nPrevious SQL failed:\nQuery: {sql}\nError: {error}\nFix the query based on this error."
-        )
+        for attempt in range(MAX_RETRIES + 1):
+            if attempt > 0:
+                retries = attempt
 
-        try:
-            sql, gen_span = generate_sql_call(schema, question, extra_context=extra_context, override=model, retries=retries)
-        except Exception as e:
-            trace.append({"stage": "generate_sql", "error": str(e), "retries": retries})
-            error = str(e)
-            continue
-        trace.append(gen_span)
+            extra_context = (
+                "" if attempt == 0
+                else f"\n\nPrevious SQL failed:\nQuery: {sql}\nError: {error}\nFix the query based on this error."
+            )
 
-        valid, reason, val_span = validate_sql_call(schema, question, sql, retries=retries)
-        trace.append(val_span)
-        if not valid:
-            error = f"SQL rejected by validator: {reason}"
-            result = {"columns": [], "rows": [], "error": error}
-            continue
+            try:
+                sql, gen_span = generate_sql_call(schema, question, extra_context=extra_context, override=model, retries=retries)
+            except Exception as e:
+                trace.append({"stage": "generate_sql", "error": str(e), "retries": retries})
+                error = str(e)
+                continue
+            trace.append(gen_span)
 
-        try:
-            result = runner.run_on_volume(db_id, sql)
-        except Exception as e:
-            error = str(e)
-            result = {"columns": [], "rows": [], "error": error}
-            continue
-        error = result.get("error", "")
-        if not error:
-            break
+            valid, reason, val_span = validate_sql_call(schema, question, sql, retries=retries)
+            trace.append(val_span)
+            if not valid:
+                error = f"SQL rejected by validator: {reason}"
+                result = {"columns": [], "rows": [], "error": error}
+                continue
+
+            with tracer.start_as_current_span("execute_sql") as exec_span:
+                exec_span.set_attribute("db_id", db_id)
+                exec_span.set_attribute("sql", sql[:500])
+                try:
+                    result = runner.run_on_volume(db_id, sql)
+                except Exception as e:
+                    error = str(e)
+                    result = {"columns": [], "rows": [], "error": error}
+                    exec_span.set_attribute("error", True)
+                    continue
+                error = result.get("error", "")
+                exec_span.set_attribute("error", bool(error))
+            if not error:
+                break
 
     return {"sql": sql, "result": result, "error": error, "retries": retries, "trace": trace}
 
