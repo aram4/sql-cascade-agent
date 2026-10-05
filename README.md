@@ -60,8 +60,50 @@ summary above: that still reads the lightweight `trace` dict on `AgentState`, wh
 eval harness can roll up — OTel here is for watching one request's actual call shape (what ran, in what
 order, how long each part took), not for the aggregate eval report.
 
-Swapping the exporter for a real backend later (Jaeger, Honeycomb, etc.) only touches `init_tracing()` in
-`src/tracing.py` — add an OTLP span processor there; nothing in `agent.py` or `eval_bird.py` changes.
+### Why this, not just print statements
+
+The three systems this agent touches per question — Fireworks (LLM calls), Modal (sandboxed execution),
+local SQLite — each only see their own slice of the work. Fireworks' dashboard knows a `generate` call used
+1290 input tokens; it has no idea a `validate` call followed it, that both belong to one question, or
+that the validator rejected the result and triggered a retry. Modal's dashboard knows a function ran for
+40ms; it has no idea which Fireworks call produced the SQL it just executed. Neither can answer "what
+actually happened, in order, to answer this one question" — only a trace that spans all three systems can,
+because that requires knowing your application's call structure, not just that a request happened.
+
+That's what the `trace_id`/`span_id`/`parent_id` fields buy you: every stage for one `run_question` call
+shares one `trace_id`, and each child span's `parent_id` points at the root — so a retry shows up as a
+second `generate_sql` span, a sibling of the first, under the same trace, instead of being indistinguishable
+noise in a flat log. The `role`/`model`/`source` attributes on each span are also a cheap but real
+robustness check: they're recorded off the actual call that ran, not off config, so a routing bug (e.g.
+`summarize_result` accidentally resolving the `generate` role) would show up immediately as a mismatched
+`model` attribute under the wrong stage — not something a config-only sanity check would catch.
+
+### Swapping in a real backend later
+
+Right now this only works *live*: `ConsoleSpanExporter` prints each span as it ends and keeps nothing —
+close the terminal and the traces are gone. That's deliberate for a "watch it run once" learning setup, but
+it's also the one thing a hosted backend buys you that this doesn't: persistence and query-ability across
+runs. Because the instrumentation uses the vendor-neutral OTel API (`tracer.start_as_current_span(...)`,
+`span.set_attribute(...)`), none of it is tied to the console exporter — swapping in an OTLP exporter only
+touches `init_tracing()` in `src/tracing.py`:
+
+```python
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(
+    endpoint=os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"],   # your backend's OTLP ingest URL
+    headers={"x-api-key": os.environ["OTEL_API_KEY"]},    # Honeycomb: x-honeycomb-team; Arize: api key headers per their docs
+)))
+```
+
+`agent.py` and `eval_bird.py` don't change at all — they only call `tracer.start_as_current_span(...)`,
+never anything exporter-specific. **Honeycomb** ingests OTLP natively and is a good fit for the generic
+distributed-tracing view above. **Arize** is purpose-built for LLM pipelines specifically (it understands
+prompts/completions/token usage as first-class fields via OpenInference semantic conventions on top of
+OTLP), which would be a closer match for actually analyzing *this* project's generate/validate/summarize
+calls than a general APM backend. Either way, the fix for "traces disappear when the terminal closes" is
+exporter configuration, not re-instrumenting the pipeline.
 
 ## Two modes, one graph
 
