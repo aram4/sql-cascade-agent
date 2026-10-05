@@ -119,6 +119,7 @@ def run_eval(db_path: str, questions: list[dict], use_sandbox: bool = False, mod
             "retries": agent_result.get("retries", 0),
             "error": agent_result.get("error", ""),
             "latency_s": round(latency, 2),
+            "trace": agent_result.get("trace", []),
         }
         results.append(entry)
 
@@ -135,9 +136,47 @@ def run_eval(db_path: str, questions: list[dict], use_sandbox: bool = False, mod
         "total": total,
         "avg_latency_s": round(avg_latency, 2),
         "retry_rate": round(retry_rate, 4),
+        "routes": summarize_routes(results),
         "results": results,
     }
     return summary
+
+
+def summarize_routes(results: list[dict]) -> list[dict]:
+    """Roll up per-stage trace spans across all questions into per-(role, model) stats —
+    this is what "measure accuracy/cost per route" is computed from."""
+    buckets: dict[tuple[str, str], dict] = {}
+
+    for r in results:
+        for span in r.get("trace", []):
+            role = span.get("role", span.get("stage", "unknown"))
+            model = span.get("model", "unknown")
+            key = (role, model)
+            bucket = buckets.setdefault(key, {
+                "role": role, "model": model, "calls": 0, "errors": 0,
+                "total_latency_ms": 0.0, "input_tokens": 0, "output_tokens": 0,
+            })
+            bucket["calls"] += 1
+            if "error" in span:
+                bucket["errors"] += 1
+                continue
+            bucket["total_latency_ms"] += span.get("latency_ms") or 0
+            bucket["input_tokens"] += span.get("input_tokens") or 0
+            bucket["output_tokens"] += span.get("output_tokens") or 0
+
+    routes = []
+    for (role, model), b in buckets.items():
+        calls = b["calls"]
+        routes.append({
+            "role": role,
+            "model": model,
+            "calls": calls,
+            "errors": b["errors"],
+            "avg_latency_ms": round(b["total_latency_ms"] / calls, 1) if calls else 0,
+            "input_tokens": b["input_tokens"],
+            "output_tokens": b["output_tokens"],
+        })
+    return sorted(routes, key=lambda x: (x["role"], x["model"]))
 
 
 def main():
@@ -171,6 +210,14 @@ def main():
     print(f"Accuracy: {summary['accuracy']:.1%} ({summary['correct']}/{summary['total']})")
     print(f"Avg latency: {summary['avg_latency_s']}s")
     print(f"Retry rate: {summary['retry_rate']:.1%}")
+
+    print("\nRoutes:")
+    for route in summary["routes"]:
+        print(
+            f"  {route['role']:<10} {route['model']:<55} calls={route['calls']:<4} "
+            f"errors={route['errors']:<3} avg_latency={route['avg_latency_ms']}ms "
+            f"tokens_in={route['input_tokens']} tokens_out={route['output_tokens']}"
+        )
 
     failures = [r for r in summary["results"] if not r["match"]]
     if failures:

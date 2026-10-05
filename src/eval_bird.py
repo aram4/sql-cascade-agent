@@ -10,9 +10,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from dotenv import load_dotenv
 load_dotenv()
 
-from src.agent import get_llm, SQLOutput, MAX_RETRIES
+from src.agent import generate_sql_call, validate_sql_call, MAX_RETRIES
 from src.sandbox import get_runner, shutdown_sandbox
-from src.eval import results_match
+from src.eval import results_match, summarize_routes
 
 BIRD_SLICE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "bird", "bird_slice.json")
 
@@ -22,53 +22,37 @@ def load_bird_slice() -> list[dict]:
         return json.load(f)
 
 
-def generate_sql_for_question(question: str, schema: str, model: str = None) -> dict:
-    """Generate SQL using Fireworks — runs locally, not on Modal."""
-    from langchain_core.messages import HumanMessage, SystemMessage
-
-    llm = get_llm(model) if model else get_llm()
-
-    messages = [
-        SystemMessage(content=(
-            "You are a SQL expert. Given a database schema and a question, "
-            "write a SQLite query that answers the question.\n"
-            "Rules:\n"
-            "- Use only tables and columns from the schema\n"
-            "- Use SQLite syntax\n"
-            "- Return only the data requested, no extra columns\n"
-            "- Use JOINs when data spans multiple tables\n"
-            "- Use COLLATE NOCASE or LOWER() for string comparisons to handle case differences\n"
-        )),
-        HumanMessage(content=f"Schema:\n{schema}\n\nQuestion: {question}"),
-    ]
-
-    try:
-        structured_llm = llm.with_structured_output(SQLOutput)
-        response = structured_llm.invoke(messages)
-        return {"sql": response.sql, "error": ""}
-    except Exception as e:
-        return {"sql": "", "error": str(e)}
-
-
 def run_with_retries(question: str, schema: str, db_id: str, runner, model: str = None) -> dict:
-    """Generate SQL and execute with retry loop."""
+    """Generate -> validate -> execute, with self-correction on either a validator
+    rejection or an execution error (mirrors the LangGraph agent's retry loop)."""
     sql = ""
     error = ""
     result = None
     retries = 0
+    trace: list[dict] = []
 
     for attempt in range(MAX_RETRIES + 1):
         if attempt > 0:
             retries = attempt
 
-        gen = generate_sql_for_question(
-            question if attempt == 0 else f"{question}\n\nPrevious SQL failed:\n{sql}\nError: {error}\nFix the query.",
-            schema,
-            model,
+        extra_context = (
+            "" if attempt == 0
+            else f"\n\nPrevious SQL failed:\nQuery: {sql}\nError: {error}\nFix the query based on this error."
         )
-        sql = gen["sql"]
-        if gen["error"]:
-            error = gen["error"]
+
+        try:
+            sql, gen_span = generate_sql_call(schema, question, extra_context=extra_context, override=model, retries=retries)
+        except Exception as e:
+            trace.append({"stage": "generate_sql", "error": str(e), "retries": retries})
+            error = str(e)
+            continue
+        trace.append(gen_span)
+
+        valid, reason, val_span = validate_sql_call(schema, question, sql, retries=retries)
+        trace.append(val_span)
+        if not valid:
+            error = f"SQL rejected by validator: {reason}"
+            result = {"columns": [], "rows": [], "error": error}
             continue
 
         try:
@@ -81,7 +65,7 @@ def run_with_retries(question: str, schema: str, db_id: str, runner, model: str 
         if not error:
             break
 
-    return {"sql": sql, "result": result, "error": error, "retries": retries}
+    return {"sql": sql, "result": result, "error": error, "retries": retries, "trace": trace}
 
 
 def run_bird_eval(questions: list[dict], model: str = None) -> dict:
@@ -120,6 +104,7 @@ def run_bird_eval(questions: list[dict], model: str = None) -> dict:
             "retries": agent["retries"],
             "error": agent["error"],
             "latency_s": round(latency, 2),
+            "trace": agent["trace"],
         }
         results.append(entry)
 
@@ -137,6 +122,7 @@ def run_bird_eval(questions: list[dict], model: str = None) -> dict:
         "total": total,
         "avg_latency_s": round(avg_latency, 2),
         "retry_rate": round(retry_rate, 4),
+        "routes": summarize_routes(results),
         "results": results,
     }
 
@@ -170,6 +156,14 @@ def main():
     print(f"Accuracy: {summary['accuracy']:.1%} ({summary['correct']}/{summary['total']})")
     print(f"Avg latency: {summary['avg_latency_s']}s")
     print(f"Retry rate: {summary['retry_rate']:.1%}")
+
+    print("\nRoutes:")
+    for route in summary["routes"]:
+        print(
+            f"  {route['role']:<10} {route['model']:<55} calls={route['calls']:<4} "
+            f"errors={route['errors']:<3} avg_latency={route['avg_latency_ms']}ms "
+            f"tokens_in={route['input_tokens']} tokens_out={route['output_tokens']}"
+        )
 
     failures = [r for r in summary["results"] if not r["match"]]
     if failures:

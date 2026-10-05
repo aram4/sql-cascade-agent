@@ -1,0 +1,5 @@
+{
+  "generate": "accounts/fireworks/models/qwen3p8-max",
+  "validate": "accounts/fireworks/models/deepseek-v4p1-flash",
+  "summarize": "accounts/fireworks/models/deepseek-v4p1-flash"
+}
