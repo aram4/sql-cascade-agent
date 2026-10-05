@@ -51,59 +51,40 @@ current Fireworks per-token rate for that model, which isn't hardcoded here sinc
 
 ## Tracing
 
-Every stage (`retrieve_schema`, `generate_sql`, `validate_sql`, `execute_sql`, `summarize_result`), plus a
-`run_question` / `run_with_retries` root span wrapping all of them, emits a real OpenTelemetry span via
-`src/tracing.py` — trace IDs, span IDs, parent/child nesting through context propagation, and attributes
-(role, model, source, tokens, retries). It's wired to the console exporter, so spans print as JSON to
-stdout with no collector or backend to stand up. This is additive, not a replacement for the `routes`
-summary above: that still reads the lightweight `trace` dict on `AgentState`, which is structured data the
-eval harness can roll up — OTel here is for watching one request's actual call shape (what ran, in what
-order, how long each part took), not for the aggregate eval report.
+Every stage, plus a `run_question` root span wrapping all of them, emits a real OpenTelemetry span via
+`src/tracing.py` — trace/span IDs, parent/child nesting, and attributes (role, model, source, tokens,
+retries). Spans print as JSON to the console, no collector needed. This is additive to the `routes` summary
+above, not a replacement — that reads the lightweight `trace` dict on `AgentState` for aggregate
+cost/accuracy; OTel is for inspecting one request's actual call shape.
 
-### Why this, not just print statements
+**Why it's worth having:**
+- Fireworks and Modal each only see their own slice — Fireworks doesn't know a `generate` call was followed
+  by a `validate` rejection and a retry; Modal doesn't know which Fireworks call produced the SQL it ran. A
+  shared `trace_id` across all three systems is the only way to see one causal chain for a single question.
+- A retry shows up as a second `generate_sql` span, sibling to the first, under the same trace — not
+  indistinguishable noise in a flat log.
+- The `role`/`model` attributes are recorded off the actual call, not off config — so a routing bug (e.g.
+  `summarize_result` silently resolving the `generate` role) would show up as a mismatched `model` under the
+  wrong stage, which a config-only check can't catch.
 
-The three systems this agent touches per question — Fireworks (LLM calls), Modal (sandboxed execution),
-local SQLite — each only see their own slice of the work. Fireworks' dashboard knows a `generate` call used
-1290 input tokens; it has no idea a `validate` call followed it, that both belong to one question, or
-that the validator rejected the result and triggered a retry. Modal's dashboard knows a function ran for
-40ms; it has no idea which Fireworks call produced the SQL it just executed. Neither can answer "what
-actually happened, in order, to answer this one question" — only a trace that spans all three systems can,
-because that requires knowing your application's call structure, not just that a request happened.
-
-That's what the `trace_id`/`span_id`/`parent_id` fields buy you: every stage for one `run_question` call
-shares one `trace_id`, and each child span's `parent_id` points at the root — so a retry shows up as a
-second `generate_sql` span, a sibling of the first, under the same trace, instead of being indistinguishable
-noise in a flat log. The `role`/`model`/`source` attributes on each span are also a cheap but real
-robustness check: they're recorded off the actual call that ran, not off config, so a routing bug (e.g.
-`summarize_result` accidentally resolving the `generate` role) would show up immediately as a mismatched
-`model` attribute under the wrong stage — not something a config-only sanity check would catch.
-
-### Swapping in a real backend later
-
-Right now this only works *live*: `ConsoleSpanExporter` prints each span as it ends and keeps nothing —
-close the terminal and the traces are gone. That's deliberate for a "watch it run once" learning setup, but
-it's also the one thing a hosted backend buys you that this doesn't: persistence and query-ability across
-runs. Because the instrumentation uses the vendor-neutral OTel API (`tracer.start_as_current_span(...)`,
-`span.set_attribute(...)`), none of it is tied to the console exporter — swapping in an OTLP exporter only
-touches `init_tracing()` in `src/tracing.py`:
+**Upgrading later:** `ConsoleSpanExporter` is live-only — close the terminal, traces are gone. Since the
+instrumentation only calls vendor-neutral OTel API (`tracer.start_as_current_span`, `span.set_attribute`),
+getting persistence and a real UI is an exporter swap in `init_tracing()`, not a re-instrumentation:
 
 ```python
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(
-    endpoint=os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"],   # your backend's OTLP ingest URL
-    headers={"x-api-key": os.environ["OTEL_API_KEY"]},    # Honeycomb: x-honeycomb-team; Arize: api key headers per their docs
+    endpoint=os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"],
+    headers={"x-api-key": os.environ["OTEL_API_KEY"]},
 )))
 ```
 
-`agent.py` and `eval_bird.py` don't change at all — they only call `tracer.start_as_current_span(...)`,
-never anything exporter-specific. **Honeycomb** ingests OTLP natively and is a good fit for the generic
-distributed-tracing view above. **Arize** is purpose-built for LLM pipelines specifically (it understands
-prompts/completions/token usage as first-class fields via OpenInference semantic conventions on top of
-OTLP), which would be a closer match for actually analyzing *this* project's generate/validate/summarize
-calls than a general APM backend. Either way, the fix for "traces disappear when the terminal closes" is
-exporter configuration, not re-instrumenting the pipeline.
+**Honeycomb** ingests OTLP natively — a good fit for the generic tracing view above. **Arize** is built for
+LLM pipelines specifically (prompts/tokens as first-class fields via OpenInference on top of OTLP) — a
+closer match for analyzing the generate/validate/summarize calls themselves. Either way, `agent.py` and
+`eval_bird.py` don't change.
 
 ## Two modes, one graph
 
@@ -127,6 +108,8 @@ The English answer is a presentation layer only. Eval accuracy is measured by co
 - **Fireworks AI** — LLM inference, routed per role (see Model routing below)
 - **Modal** — sandboxed query execution with timeouts and parallel eval harness
 - **BIRD benchmark** — evaluation dataset (SQLite databases + natural language questions)
+- **OpenTelemetry** — per-stage tracing (console exporter today; a vendor-neutral API means dropping in a
+  real observability backend like Honeycomb or Arize later is an exporter swap, not a rewrite)
 
 ## Quick start
 
