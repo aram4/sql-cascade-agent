@@ -46,8 +46,8 @@ ROLES = tuple(DEFAULT_ROUTES)
 ROLE_MAX_TOKENS: dict[str, int] = {
     "generate": 4096,
     "validate": 1024,
-    "summarize": 512,
-    "judge": 512,
+    "summarize": 1536,
+    "judge": 1024,
 }
 
 

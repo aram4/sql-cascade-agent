@@ -115,12 +115,16 @@ def run_bird_eval(questions: list[dict], model: str = None, judge_summary: bool 
         faithful = None
         judge_reason = ""
         if judge_summary and not agent["error"] and agent["result"]:
-            answer, sum_span = summarize_result_call(q["question"], agent["result"])
-            faithful, judge_reason, judge_span = judge_summary_call(q["question"], agent["result"], answer)
-            trace = trace + [sum_span, judge_span]
-            judged += 1
-            if faithful:
-                faithful_count += 1
+            try:
+                answer, sum_span = summarize_result_call(q["question"], agent["result"])
+                faithful, judge_reason, judge_span = judge_summary_call(q["question"], agent["result"], answer)
+                trace = trace + [sum_span, judge_span]
+                judged += 1
+                if faithful:
+                    faithful_count += 1
+            except Exception as e:
+                judge_reason = f"judge pass failed: {e}"
+                trace = trace + [{"stage": "judge_summary", "error": str(e)}]
 
         entry = {
             "question_id": q.get("question_id", i),

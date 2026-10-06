@@ -55,6 +55,21 @@ class AgentState(BaseModel):
     trace: List[dict] = []
 
 
+ROW_PREVIEW_LIMIT = 50
+
+
+def _format_rows(columns: list, rows: list) -> str:
+    """Caps how many rows get stuffed into a summarize/judge prompt. A result set with
+    hundreds of rows was overwhelming those roles' output budget before they ever got
+    to their final answer — capping input size here fixes that at the source, instead
+    of just raising the output ceiling and hoping the next large result set fits."""
+    preview = rows[:ROW_PREVIEW_LIMIT]
+    formatted = "\n".join(str(dict(zip(columns, row))) for row in preview)
+    if len(rows) > ROW_PREVIEW_LIMIT:
+        formatted += f"\n... and {len(rows) - ROW_PREVIEW_LIMIT} more rows (total {len(rows)} rows)"
+    return formatted
+
+
 def _usage_from_raw(raw) -> Optional[dict]:
     usage = getattr(raw, "usage_metadata", None)
     if not usage:
@@ -210,9 +225,7 @@ def judge_summary_call(question: str, result: dict, answer: str) -> tuple[bool, 
     llm, resolution = get_llm_for_role("judge")
     start = time.perf_counter()
 
-    rows = result["rows"]
-    columns = result["columns"]
-    formatted = "\n".join(str(dict(zip(columns, row))) for row in rows)
+    formatted = _format_rows(result["columns"], result["rows"])
 
     with tracer.start_as_current_span("judge_summary") as otel_span:
         otel_span.set_attribute("role", resolution.role)
@@ -335,9 +348,7 @@ def summarize_result_call(question: str, result: dict) -> tuple[str, dict]:
         otel_span.set_attribute("model", resolution.model)
         otel_span.set_attribute("model_source", resolution.source)
 
-        rows = result["rows"]
-        columns = result["columns"]
-        formatted = "\n".join(str(dict(zip(columns, row))) for row in rows)
+        formatted = _format_rows(result["columns"], result["rows"])
 
         messages = [
             SystemMessage(content="You answer questions in plain English based on SQL query results. Be concise and direct. Don't forget that data will be uppercased in SQL"),

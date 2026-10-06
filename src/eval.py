@@ -120,13 +120,17 @@ def run_eval(db_path: str, questions: list[dict], use_sandbox: bool = False, mod
         faithful = None
         judge_reason = ""
         if judge_summary and not agent_result.get("error") and agent_result.get("result"):
-            faithful, judge_reason, judge_span = judge_summary_call(
-                q["question"], agent_result["result"], agent_result["answer"]
-            )
-            trace = trace + [judge_span]
-            judged += 1
-            if faithful:
-                faithful_count += 1
+            try:
+                faithful, judge_reason, judge_span = judge_summary_call(
+                    q["question"], agent_result["result"], agent_result["answer"]
+                )
+                trace = trace + [judge_span]
+                judged += 1
+                if faithful:
+                    faithful_count += 1
+            except Exception as e:
+                judge_reason = f"judge pass failed: {e}"
+                trace = trace + [{"stage": "judge_summary", "error": str(e)}]
 
         entry = {
             "question_id": q["question_id"],
