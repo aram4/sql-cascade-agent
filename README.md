@@ -9,7 +9,7 @@ A text-to-SQL agent that routes between a small and large LLM to optimize cost v
 3. **Validation** (`validate` role) — a cheap/fast model checks the candidate SQL against the schema before anything executes, rejecting hallucinated tables/columns or broken syntax without spending a sandbox round trip
 4. **Execution** — runs the generated SQL in an isolated Modal sandbox with timeouts, or locally for interactive use
 5. **Self-correction** — on a validator rejection or an execution error, feeds the reason back to the generator and retries (max 2 attempts)
-6. **Summarization** (`summarize` role) — a cheap/fast model turns the result set into a plain-English answer (chat mode only; skipped in eval mode)
+6. **Summarization** (`summarize` role) — a cheap/fast model turns the result set into a plain-English answer (chat mode only; skipped in eval mode unless judged — see LLM-as-judge below)
 7. **Cascade routing** *(planned)* — tries the small model first within the `generate` role; escalates to the large model on execution error or empty result
 
 ## Model routing
@@ -25,7 +25,8 @@ token usage — so the resolved model for every call is visible after the fact, 
 {
   "generate": "accounts/fireworks/models/qwen3p8-max",          // strong model, writes the SQL
   "validate": "accounts/fireworks/models/deepseek-v4p1-flash",  // cheap/fast, schema-grounded lint
-  "summarize": "accounts/fireworks/models/deepseek-v4p1-flash"  // cheap/fast, presentation only
+  "summarize": "accounts/fireworks/models/deepseek-v4p1-flash", // cheap/fast, presentation only
+  "judge": "accounts/fireworks/models/deepseek-v4p1-flash"      // cheap/fast, eval-only faithfulness check
 }
 ```
 
@@ -48,6 +49,29 @@ Routes:
 
 Token counts are from each provider's `usage_metadata`; converting to dollars just needs multiplying by your
 current Fireworks per-token rate for that model, which isn't hardcoded here since it changes over time.
+
+## LLM-as-judge: summary faithfulness
+
+Execution accuracy (comparing result sets) is deterministic and doesn't need an LLM judge — a row either
+matches the gold rows or it doesn't. The one output with no ground truth to diff against is the English
+answer from `summarize_result`: free text, no gold sentence to compare it to. That's the one place an LLM
+judge actually earns its keep here, so it's the only thing judged.
+
+- **What's checked:** not "is the SQL correct" — a separate `judge` role reads the question, the *actual*
+  SQL result rows, and the English answer, and scores whether the answer is faithful to those rows (no
+  hallucinated numbers, no dropped/misread data).
+- **Opt-in, not default:** pass `--judge-summary` to either eval CLI. It's off by default because it adds
+  two more model calls per question (`summarize_result` + `judge`) that eval mode normally skips — only pay
+  for it when you want the faithfulness number.
+- **Independent from accuracy, deliberately:** a question can fail execution accuracy (wrong SQL) and still
+  be marked faithful, if the summary honestly describes the (wrong) rows that SQL happened to return. Those
+  are two different failure modes — bad query vs. dishonest narration — and conflating them into one score
+  would hide which one you're actually looking at.
+
+```bash
+python3 src/eval.py --judge-summary
+python3 src/eval_bird.py --limit=50 --judge-summary
+```
 
 ## Tracing
 

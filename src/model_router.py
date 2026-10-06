@@ -33,6 +33,7 @@ DEFAULT_ROUTES: dict[str, str] = {
     "generate": "accounts/fireworks/models/qwen3p8-max",          # strong model: writes the SQL
     "validate": "accounts/fireworks/models/deepseek-v4p1-flash",  # cheap/fast: schema-grounded lint before execution
     "summarize": "accounts/fireworks/models/deepseek-v4p1-flash", # cheap/fast: presentation layer only
+    "judge": "accounts/fireworks/models/deepseek-v4p1-flash",     # cheap/fast: eval-only faithfulness check on the summary
 }
 
 ROLES = tuple(DEFAULT_ROUTES)
@@ -46,6 +47,7 @@ ROLE_MAX_TOKENS: dict[str, int] = {
     "generate": 4096,
     "validate": 1024,
     "summarize": 512,
+    "judge": 512,
 }
 
 

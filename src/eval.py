@@ -8,7 +8,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from src.agent import run_question
+from src.agent import run_question, judge_summary_call
 from src.eval_questions import SAMPLE_EVAL
 from setup_sample_db import create, DB_PATH
 
@@ -89,15 +89,21 @@ def results_match(generated: dict, gold: dict) -> bool:
     return True
 
 
-def run_eval(db_path: str, questions: list[dict], use_sandbox: bool = False, model: str = None) -> dict:
+def run_eval(db_path: str, questions: list[dict], use_sandbox: bool = False, model: str = None, judge_summary: bool = False) -> dict:
+    """`judge_summary`, if set, additionally runs summarize_result (normally skipped in
+    eval mode) and scores the English answer's faithfulness to the SQL result rows with
+    an LLM judge. It's the one output here with no ground-truth string to diff against,
+    so it's checked separately from — not folded into — execution accuracy."""
     results = []
     correct = 0
+    judged = 0
+    faithful_count = 0
     total = len(questions)
 
     for i, q in enumerate(questions):
         start = time.time()
 
-        kwargs = {"question": q["question"], "db_path": db_path, "use_sandbox": use_sandbox, "summarize": False}
+        kwargs = {"question": q["question"], "db_path": db_path, "use_sandbox": use_sandbox, "summarize": judge_summary}
         if model:
             kwargs["model"] = model
 
@@ -110,6 +116,18 @@ def run_eval(db_path: str, questions: list[dict], use_sandbox: bool = False, mod
         if match:
             correct += 1
 
+        trace = agent_result.get("trace", [])
+        faithful = None
+        judge_reason = ""
+        if judge_summary and not agent_result.get("error") and agent_result.get("result"):
+            faithful, judge_reason, judge_span = judge_summary_call(
+                q["question"], agent_result["result"], agent_result["answer"]
+            )
+            trace = trace + [judge_span]
+            judged += 1
+            if faithful:
+                faithful_count += 1
+
         entry = {
             "question_id": q["question_id"],
             "question": q["question"],
@@ -119,12 +137,15 @@ def run_eval(db_path: str, questions: list[dict], use_sandbox: bool = False, mod
             "retries": agent_result.get("retries", 0),
             "error": agent_result.get("error", ""),
             "latency_s": round(latency, 2),
-            "trace": agent_result.get("trace", []),
+            "trace": trace,
+            "faithful": faithful,
+            "judge_reason": judge_reason,
         }
         results.append(entry)
 
         status = "PASS" if match else "FAIL"
-        print(f"  [{i+1}/{total}] {status} ({latency:.1f}s) — {q['question'][:60]}")
+        judge_tag = "" if faithful is None else (" | faithful" if faithful else " | UNFAITHFUL")
+        print(f"  [{i+1}/{total}] {status} ({latency:.1f}s){judge_tag} — {q['question'][:60]}")
 
     accuracy = correct / total if total > 0 else 0
     avg_latency = sum(r["latency_s"] for r in results) / total if total > 0 else 0
@@ -139,6 +160,9 @@ def run_eval(db_path: str, questions: list[dict], use_sandbox: bool = False, mod
         "routes": summarize_routes(results),
         "results": results,
     }
+    if judge_summary:
+        summary["faithfulness_rate"] = round(faithful_count / judged, 4) if judged else None
+        summary["judged"] = judged
     return summary
 
 
@@ -184,6 +208,7 @@ def main():
         create()
 
     use_sandbox = "--sandbox" in sys.argv
+    judge_summary = "--judge-summary" in sys.argv
     model = None
     for arg in sys.argv:
         if arg.startswith("--model="):
@@ -192,6 +217,7 @@ def main():
     print(f"Running eval: {len(SAMPLE_EVAL)} questions")
     print(f"Database: {DB_PATH}")
     print(f"Sandbox: {use_sandbox}")
+    print(f"Judge summary: {judge_summary}")
     if model:
         print(f"Model: {model}")
     print("-" * 60)
@@ -201,7 +227,7 @@ def main():
         get_runner().start()
 
     try:
-        summary = run_eval(DB_PATH, SAMPLE_EVAL, use_sandbox=use_sandbox, model=model)
+        summary = run_eval(DB_PATH, SAMPLE_EVAL, use_sandbox=use_sandbox, model=model, judge_summary=judge_summary)
     finally:
         if use_sandbox:
             shutdown_sandbox()
@@ -210,6 +236,9 @@ def main():
     print(f"Accuracy: {summary['accuracy']:.1%} ({summary['correct']}/{summary['total']})")
     print(f"Avg latency: {summary['avg_latency_s']}s")
     print(f"Retry rate: {summary['retry_rate']:.1%}")
+    if judge_summary:
+        rate = summary["faithfulness_rate"]
+        print(f"Summary faithfulness: {rate:.1%} ({summary['judged']} judged)" if rate is not None else "Summary faithfulness: n/a (nothing judged)")
 
     print("\nRoutes:")
     for route in summary["routes"]:
@@ -228,6 +257,14 @@ def main():
             print(f"    Generated: {f['generated_sql'][:80]}")
             if f["error"]:
                 print(f"    Error: {f['error'][:80]}")
+
+    if judge_summary:
+        unfaithful = [r for r in summary["results"] if r["faithful"] is False]
+        if unfaithful:
+            print(f"\nUnfaithful summaries ({len(unfaithful)}):")
+            for u in unfaithful:
+                print(f"  Q{u['question_id']}: {u['question'][:50]}")
+                print(f"    Reason: {u['judge_reason'][:100]}")
 
     out_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "eval_results.json")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)

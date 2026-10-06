@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from dotenv import load_dotenv
 load_dotenv()
 
-from src.agent import generate_sql_call, validate_sql_call, MAX_RETRIES
+from src.agent import generate_sql_call, validate_sql_call, summarize_result_call, judge_summary_call, MAX_RETRIES
 from src.sandbox import get_runner, shutdown_sandbox
 from src.eval import results_match, summarize_routes
 from src.tracing import get_tracer
@@ -80,10 +80,15 @@ def run_with_retries(question: str, schema: str, db_id: str, runner, model: str 
     return {"sql": sql, "result": result, "error": error, "retries": retries, "trace": trace}
 
 
-def run_bird_eval(questions: list[dict], model: str = None) -> dict:
+def run_bird_eval(questions: list[dict], model: str = None, judge_summary: bool = False) -> dict:
+    """`judge_summary`, if set, additionally generates an English answer (normally
+    skipped in this harness) and scores its faithfulness to the SQL result rows —
+    see src/eval.py's run_eval for why that's judged separately from execution accuracy."""
     runner = get_runner()
     results = []
     correct = 0
+    judged = 0
+    faithful_count = 0
     total = len(questions)
 
     schema_cache = {}
@@ -106,6 +111,17 @@ def run_bird_eval(questions: list[dict], model: str = None) -> dict:
         if match:
             correct += 1
 
+        trace = agent["trace"]
+        faithful = None
+        judge_reason = ""
+        if judge_summary and not agent["error"] and agent["result"]:
+            answer, sum_span = summarize_result_call(q["question"], agent["result"])
+            faithful, judge_reason, judge_span = judge_summary_call(q["question"], agent["result"], answer)
+            trace = trace + [sum_span, judge_span]
+            judged += 1
+            if faithful:
+                faithful_count += 1
+
         entry = {
             "question_id": q.get("question_id", i),
             "db_id": db_id,
@@ -116,18 +132,21 @@ def run_bird_eval(questions: list[dict], model: str = None) -> dict:
             "retries": agent["retries"],
             "error": agent["error"],
             "latency_s": round(latency, 2),
-            "trace": agent["trace"],
+            "trace": trace,
+            "faithful": faithful,
+            "judge_reason": judge_reason,
         }
         results.append(entry)
 
         status = "PASS" if match else "FAIL"
-        print(f"  [{i+1}/{total}] {status} ({latency:.1f}s) {db_id}: {q['question'][:50]}")
+        judge_tag = "" if faithful is None else (" | faithful" if faithful else " | UNFAITHFUL")
+        print(f"  [{i+1}/{total}] {status} ({latency:.1f}s){judge_tag} {db_id}: {q['question'][:50]}")
 
     accuracy = correct / total if total > 0 else 0
     avg_latency = sum(r["latency_s"] for r in results) / total if total > 0 else 0
     retry_rate = sum(1 for r in results if r["retries"] > 0) / total if total > 0 else 0
 
-    return {
+    summary = {
         "model": model or "default",
         "accuracy": round(accuracy, 4),
         "correct": correct,
@@ -137,11 +156,16 @@ def run_bird_eval(questions: list[dict], model: str = None) -> dict:
         "routes": summarize_routes(results),
         "results": results,
     }
+    if judge_summary:
+        summary["faithfulness_rate"] = round(faithful_count / judged, 4) if judged else None
+        summary["judged"] = judged
+    return summary
 
 
 def main():
     model = None
     limit = None
+    judge_summary = "--judge-summary" in sys.argv
     for arg in sys.argv[1:]:
         if arg.startswith("--model="):
             model = arg.split("=", 1)[1]
@@ -155,12 +179,13 @@ def main():
     print(f"Running BIRD eval: {len(questions)} questions")
     if model:
         print(f"Model: {model}")
+    print(f"Judge summary: {judge_summary}")
     dbs = set(q["db_id"] for q in questions)
     print(f"Databases: {len(dbs)} ({', '.join(sorted(dbs))})")
     print("-" * 60)
 
     try:
-        summary = run_bird_eval(questions, model=model)
+        summary = run_bird_eval(questions, model=model, judge_summary=judge_summary)
     finally:
         shutdown_sandbox()
 
@@ -168,6 +193,9 @@ def main():
     print(f"Accuracy: {summary['accuracy']:.1%} ({summary['correct']}/{summary['total']})")
     print(f"Avg latency: {summary['avg_latency_s']}s")
     print(f"Retry rate: {summary['retry_rate']:.1%}")
+    if judge_summary:
+        rate = summary["faithfulness_rate"]
+        print(f"Summary faithfulness: {rate:.1%} ({summary['judged']} judged)" if rate is not None else "Summary faithfulness: n/a (nothing judged)")
 
     print("\nRoutes:")
     for route in summary["routes"]:

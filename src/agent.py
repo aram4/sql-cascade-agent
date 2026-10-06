@@ -33,6 +33,11 @@ class ValidationOutput(BaseModel):
     reason: str = Field(description="Why it's invalid; empty string if valid")
 
 
+class JudgeOutput(BaseModel):
+    faithful: bool = Field(description="Whether the English answer accurately reflects the SQL result rows, with no hallucinated or mischaracterized values")
+    reason: str = Field(description="Why it's unfaithful; empty string if faithful")
+
+
 class AgentState(BaseModel):
     question: str
     db_path: str
@@ -120,6 +125,13 @@ VALIDATE_SYSTEM_PROMPT = (
     "broken. Don't reject a query just because you'd have written it differently."
 )
 
+JUDGE_SYSTEM_PROMPT = (
+    "You check whether an English answer accurately reflects a SQL query's result rows. "
+    "Mark it unfaithful if it states a number, name, or fact not supported by the rows, "
+    "drops or misreads a row, or asserts something the rows don't show. Don't mark it "
+    "unfaithful just for phrasing, rounding, or omitting rows the question didn't ask for."
+)
+
 
 def generate_sql_call(schema: str, question: str, extra_context: str = "", override: str = "", retries: int = 0) -> tuple[str, dict]:
     """Role: generate. Shared by the LangGraph node and the BIRD eval harness."""
@@ -188,6 +200,51 @@ def validate_sql_call(schema: str, question: str, sql: str, retries: int = 0) ->
 
     span = make_span(resolution, "validate_sql", start, usage, retries=retries)
     return parsed.valid, parsed.reason, span
+
+
+def judge_summary_call(question: str, result: dict, answer: str) -> tuple[bool, str, dict]:
+    """Role: judge. Eval-only — scores whether the English answer is faithful to the
+    actual SQL result rows. Not part of the interactive pipeline: it's a second
+    opinion on the one non-deterministic, un-gradable-by-diff output this agent
+    produces, not something a chat-mode user needs to pay latency for."""
+    llm, resolution = get_llm_for_role("judge")
+    start = time.perf_counter()
+
+    rows = result["rows"]
+    columns = result["columns"]
+    formatted = "\n".join(str(dict(zip(columns, row))) for row in rows)
+
+    with tracer.start_as_current_span("judge_summary") as otel_span:
+        otel_span.set_attribute("role", resolution.role)
+        otel_span.set_attribute("model", resolution.model)
+        otel_span.set_attribute("model_source", resolution.source)
+
+        messages = [
+            SystemMessage(content=JUDGE_SYSTEM_PROMPT),
+            HumanMessage(content=(
+                f"Question: {question}\n\n"
+                f"SQL Result:\n{formatted}\n\n"
+                f"English answer to check:\n{answer}"
+            )),
+        ]
+
+        structured_llm = llm.with_structured_output(JudgeOutput, include_raw=True)
+        response = structured_llm.invoke(messages)
+        parsed = response["parsed"]
+        if parsed is None:
+            otel_span.set_attribute("error", True)
+            raise RuntimeError(
+                f"judge stage ({resolution.model}) returned unparseable output: {response.get('parsing_error')}"
+            )
+
+        usage = _usage_from_raw(response["raw"])
+        if usage:
+            otel_span.set_attribute("input_tokens", usage.get("input_tokens") or 0)
+            otel_span.set_attribute("output_tokens", usage.get("output_tokens") or 0)
+        otel_span.set_attribute("faithful", parsed.faithful)
+
+    span = make_span(resolution, "judge_summary", start, usage)
+    return parsed.faithful, parsed.reason, span
 
 
 def generate_sql(state: AgentState) -> dict:
@@ -267,10 +324,9 @@ def _execute_sql_modal(state: AgentState) -> dict:
         return {"result": None, "error": str(e)}
 
 
-def summarize_result(state: AgentState) -> dict:
-    if state.error or not state.result:
-        return {"answer": f"Sorry, I couldn't answer that. Error: {state.error}"}
-
+def summarize_result_call(question: str, result: dict) -> tuple[str, dict]:
+    """Role: summarize. Shared by the LangGraph node and the BIRD eval harness's
+    optional judge pass (which needs an English answer to judge in the first place)."""
     llm, resolution = get_llm_for_role("summarize")
     start = time.perf_counter()
 
@@ -279,14 +335,14 @@ def summarize_result(state: AgentState) -> dict:
         otel_span.set_attribute("model", resolution.model)
         otel_span.set_attribute("model_source", resolution.source)
 
-        rows = state.result["rows"]
-        columns = state.result["columns"]
+        rows = result["rows"]
+        columns = result["columns"]
         formatted = "\n".join(str(dict(zip(columns, row))) for row in rows)
 
         messages = [
             SystemMessage(content="You answer questions in plain English based on SQL query results. Be concise and direct. Don't forget that data will be uppercased in SQL"),
             HumanMessage(content=(
-                f"Question: {state.question}\n\n"
+                f"Question: {question}\n\n"
                 f"SQL Result:\n{formatted}\n\n"
                 f"Answer the question in a natural sentence."
             )),
@@ -298,7 +354,15 @@ def summarize_result(state: AgentState) -> dict:
             otel_span.set_attribute("output_tokens", usage.get("output_tokens") or 0)
 
     span = make_span(resolution, "summarize_result", start, usage)
-    return {"answer": response.content, "trace": state.trace + [span]}
+    return response.content, span
+
+
+def summarize_result(state: AgentState) -> dict:
+    if state.error or not state.result:
+        return {"answer": f"Sorry, I couldn't answer that. Error: {state.error}"}
+
+    answer, span = summarize_result_call(state.question, state.result)
+    return {"answer": answer, "trace": state.trace + [span]}
 
 
 def check_result(state: AgentState) -> dict:
