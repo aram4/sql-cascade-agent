@@ -20,7 +20,7 @@ tracer = get_tracer()
 
 MAX_RETRIES = 2
 
-_schema_cache: dict[str, str] = {}
+_schema_cache: dict[tuple[str, bool], str] = {}
 
 
 class SQLOutput(BaseModel):
@@ -53,6 +53,7 @@ class AgentState(BaseModel):
     summarize: bool = True
     generate_model_override: str = ""
     trace: List[dict] = []
+    pg_schema: str = ""  # set -> execute against Postgres instead of SQLite/Modal (schema name to run under)
 
 
 ROW_PREVIEW_LIMIT = 50
@@ -78,12 +79,21 @@ def _usage_from_raw(raw) -> Optional[dict]:
 
 
 def retrieve_schema(state: AgentState) -> dict:
+    # Postgres lowercases every identifier at migration time (see pg_migrate.py) — the
+    # schema description shown to the generator has to match exactly, or it quotes a
+    # mixed-case name copied straight from here and Postgres can't find the column.
+    lowercase = bool(state.pg_schema)
+    cache_key = (state.db_path, lowercase)
+
     with tracer.start_as_current_span("retrieve_schema") as span:
         span.set_attribute("db_path", state.db_path)
-        cache_hit = state.db_path in _schema_cache
+        cache_hit = cache_key in _schema_cache
         span.set_attribute("cache_hit", cache_hit)
         if cache_hit:
-            return {"schema": _schema_cache[state.db_path]}
+            return {"schema": _schema_cache[cache_key]}
+
+        def ident(name: str) -> str:
+            return name.lower() if lowercase else name
 
         conn = sqlite3.connect(state.db_path)
         cursor = conn.cursor()
@@ -96,21 +106,21 @@ def retrieve_schema(state: AgentState) -> dict:
         for table in tables:
             cursor.execute(f"PRAGMA table_info('{table}')")
             columns = cursor.fetchall()
-            col_defs = [f"  {c[1]} {c[2]}{'  PRIMARY KEY' if c[5] else ''}" for c in columns]
+            col_defs = [f"  {ident(c[1])} {c[2]}{'  PRIMARY KEY' if c[5] else ''}" for c in columns]
 
             cursor.execute(f"PRAGMA foreign_key_list('{table}')")
             fks = cursor.fetchall()
-            fk_defs = [f"  FOREIGN KEY ({fk[3]}) REFERENCES {fk[2]}({fk[4]})" for fk in fks]
+            fk_defs = [f"  FOREIGN KEY ({ident(fk[3])}) REFERENCES {ident(fk[2])}({ident(fk[4])})" for fk in fks]
 
             cursor.execute(f"SELECT * FROM '{table}' LIMIT 3")
             sample_rows = cursor.fetchall()
-            col_names = [desc[0] for desc in cursor.description]
+            col_names = [ident(desc[0]) for desc in cursor.description]
             sample_str = "\n".join(
                 "  " + str(dict(zip(col_names, row))) for row in sample_rows
             )
 
             schema_parts.append(
-                f"CREATE TABLE {table} (\n"
+                f"CREATE TABLE {ident(table)} (\n"
                 + ",\n".join(col_defs)
                 + ("\n" + ",\n".join(fk_defs) if fk_defs else "")
                 + "\n);\n"
@@ -119,11 +129,11 @@ def retrieve_schema(state: AgentState) -> dict:
 
         conn.close()
         schema = "\n\n".join(schema_parts)
-        _schema_cache[state.db_path] = schema
+        _schema_cache[cache_key] = schema
         return {"schema": schema}
 
 
-GENERATE_SYSTEM_PROMPT = (
+GENERATE_SYSTEM_PROMPT_SQLITE = (
     "You are a SQL expert. Given a database schema and a question, "
     "write a SQLite query that answers the question.\n"
     "Rules:\n"
@@ -132,6 +142,20 @@ GENERATE_SYSTEM_PROMPT = (
     "- Return only the data requested, no extra columns\n"
     "- Use JOINs when data spans multiple tables\n"
     "- Use COLLATE NOCASE or LOWER() for string comparisons to handle case differences\n"
+)
+
+GENERATE_SYSTEM_PROMPT_POSTGRES = (
+    "You are a SQL expert. Given a database schema and a question, "
+    "write a PostgreSQL query that answers the question.\n"
+    "Rules:\n"
+    "- Use only tables and columns from the schema\n"
+    "- Use PostgreSQL syntax: double-quote identifiers that need quoting (never backticks), "
+    "and use LIMIT n OFFSET m (never LIMIT m,n)\n"
+    "- Table and column names were lowercased when this database was loaded — write "
+    "identifiers in lowercase, whether quoted or not\n"
+    "- Return only the data requested, no extra columns\n"
+    "- Use JOINs when data spans multiple tables\n"
+    "- Use LOWER() for string comparisons to handle case differences\n"
 )
 
 VALIDATE_SYSTEM_PROMPT = (
@@ -148,19 +172,22 @@ JUDGE_SYSTEM_PROMPT = (
 )
 
 
-def generate_sql_call(schema: str, question: str, extra_context: str = "", override: str = "", retries: int = 0) -> tuple[str, dict]:
+def generate_sql_call(schema: str, question: str, extra_context: str = "", override: str = "", retries: int = 0, dialect: str = "sqlite") -> tuple[str, dict]:
     """Role: generate. Shared by the LangGraph node and the BIRD eval harness."""
     llm, resolution = get_llm_for_role("generate", override=override or None)
     start = time.perf_counter()
+
+    system_prompt = GENERATE_SYSTEM_PROMPT_POSTGRES if dialect == "postgres" else GENERATE_SYSTEM_PROMPT_SQLITE
 
     with tracer.start_as_current_span("generate_sql") as otel_span:
         otel_span.set_attribute("role", resolution.role)
         otel_span.set_attribute("model", resolution.model)
         otel_span.set_attribute("model_source", resolution.source)
         otel_span.set_attribute("retries", retries)
+        otel_span.set_attribute("dialect", dialect)
 
         messages = [
-            SystemMessage(content=GENERATE_SYSTEM_PROMPT),
+            SystemMessage(content=system_prompt),
             HumanMessage(content=f"Schema:\n{schema}\n\nQuestion: {question}{extra_context}"),
         ]
 
@@ -284,6 +311,7 @@ def generate_sql(state: AgentState) -> dict:
         extra_context=f"{history_context}{error_context}",
         override=state.generate_model_override,
         retries=state.retries,
+        dialect="postgres" if state.pg_schema else "sqlite",
     )
     return {"sql": sql, "trace": state.trace + [span]}
 
@@ -303,10 +331,35 @@ def route_after_validate(state: AgentState) -> str:
 def execute_sql(state: AgentState) -> dict:
     with tracer.start_as_current_span("execute_sql") as span:
         span.set_attribute("use_sandbox", state.use_sandbox)
+        span.set_attribute("pg_schema", state.pg_schema)
         span.set_attribute("sql", state.sql[:500])
-        result = _execute_sql_modal(state) if state.use_sandbox else _execute_sql_local(state)
+        if state.pg_schema:
+            result = _execute_sql_postgres(state)
+        elif state.use_sandbox:
+            result = _execute_sql_modal(state)
+        else:
+            result = _execute_sql_local(state)
         span.set_attribute("error", bool(result.get("error")))
         return result
+
+
+def _execute_sql_postgres(state: AgentState) -> dict:
+    import os
+    import psycopg
+    from psycopg import sql as pg_sql
+    from src.pg_dialect import sqlite_to_postgres
+
+    try:
+        translated_sql = sqlite_to_postgres(state.sql)
+        with psycopg.connect(os.environ["PG_AGENT_DSN"]) as conn:
+            with conn.cursor() as cur:
+                cur.execute(pg_sql.SQL("SET search_path TO {}").format(pg_sql.Identifier(state.pg_schema.lower())))
+                cur.execute(translated_sql)
+                columns = [desc[0] for desc in cur.description] if cur.description else []
+                rows = cur.fetchall()
+        return {"result": {"columns": columns, "rows": rows}, "error": ""}
+    except Exception as e:
+        return {"result": None, "error": str(e)}
 
 
 def _execute_sql_local(state: AgentState) -> dict:
@@ -411,14 +464,20 @@ def build_graph() -> StateGraph:
     return graph.compile()
 
 
-def run_question(question: str, db_path: str, history: List[dict] = None, model: str = None, use_sandbox: bool = False, summarize: bool = True) -> dict:
+def run_question(question: str, db_path: str, history: List[dict] = None, model: str = None, use_sandbox: bool = False, summarize: bool = True, pg_schema: str = "") -> dict:
     """`model`, if given, overrides only the `generate` role's model for this call
     (the lever used to compare small vs. large generation models in evals).
-    The `validate` and `summarize` roles always resolve from model_routes.json."""
+    The `validate` and `summarize` roles always resolve from model_routes.json.
+
+    `pg_schema`, if given, executes against that Postgres schema instead of
+    SQLite/Modal (see _execute_sql_postgres). `db_path` is still required in this
+    mode — schema retrieval reads the local SQLite copy purely to describe the
+    schema to the LLM; only execution moves to Postgres."""
     with tracer.start_as_current_span("run_question") as span:
         span.set_attribute("question", question)
         span.set_attribute("db_path", db_path)
         span.set_attribute("use_sandbox", use_sandbox)
+        span.set_attribute("pg_schema", pg_schema)
 
         graph = build_graph()
         initial_state = AgentState(
@@ -428,5 +487,6 @@ def run_question(question: str, db_path: str, history: List[dict] = None, model:
             use_sandbox=use_sandbox,
             summarize=summarize,
             generate_model_override=model or "",
+            pg_schema=pg_schema,
         )
         return graph.invoke(initial_state)

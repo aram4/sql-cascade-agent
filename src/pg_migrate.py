@@ -140,6 +140,25 @@ def apply_foreign_keys(pconn: psycopg.Connection, schema: str, fks: list[tuple])
     pconn.commit()
 
 
+READONLY_ROLE = "agent_readonly"
+
+
+def grant_readonly_access(pconn: psycopg.Connection, schema: str) -> None:
+    """The agent executes generated SQL as READONLY_ROLE, never as the migration's
+    own (superuser-ish) connection — Postgres permissions are the sandbox now, the
+    same way Modal's ephemeral sandbox was the isolation layer for raw SQLite."""
+    schema_id = sql.Identifier(schema.lower())
+    role_id = sql.Identifier(READONLY_ROLE)
+    with pconn.cursor() as pcur:
+        pcur.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(schema_id, role_id))
+        pcur.execute(sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA {} TO {}").format(schema_id, role_id))
+        pcur.execute(
+            sql.SQL("ALTER DEFAULT PRIVILEGES IN SCHEMA {} GRANT SELECT ON TABLES TO {}").format(schema_id, role_id)
+        )
+    pconn.commit()
+    print(f"  granted read-only access on schema {schema!r} to {READONLY_ROLE!r}")
+
+
 def migrate(sqlite_path: str, schema: str, pg_dsn: str = None) -> None:
     pg_dsn = pg_dsn or os.environ["PG_DSN"]
     sconn = sqlite3.connect(sqlite_path)
@@ -159,6 +178,8 @@ def migrate(sqlite_path: str, schema: str, pg_dsn: str = None) -> None:
     if all_fks:
         print(f"Applying {len(all_fks)} foreign keys...")
         apply_foreign_keys(pconn, schema, all_fks)
+
+    grant_readonly_access(pconn, schema)
 
     sconn.close()
     pconn.close()
