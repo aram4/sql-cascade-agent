@@ -50,6 +50,27 @@ Routes:
 Token counts are from each provider's `usage_metadata`; converting to dollars just needs multiplying by your
 current Fireworks per-token rate for that model, which isn't hardcoded here since it changes over time.
 
+## Router classifier
+
+`src/router_features.py` + `src/train_router.py` are the one component in this project trained from
+scratch on its own data, rather than a prompt to someone else's foundation model: a classical classifier
+(logistic regression / gradient boosting) predicting, before either `generate` model is called, whether
+the cheap one is likely sufficient or the question should escalate to the strong one.
+
+Deliberately not an LLM: cascading only saves money if the routing decision itself is close to free. An
+LLM-based router would add a real token/latency cost to every question just to decide not to escalate it,
+defeating the point. The classifier runs on 15 hand-built features (question text/keywords, BIRD's own
+difficulty label, schema size) in microseconds on CPU, no API call.
+
+**Training data**: run both models over the same question set (`eval_bird.py --model=...`), then label
+`needs_big = 1` only where the small model failed *and* the large model succeeded — i.e. escalating
+demonstrably would have helped.
+
+**Honest result so far**: of 125 BIRD questions, only 6 are `needs_big = 1`. Too little signal to train a
+useful classifier yet — the highest-accuracy model (90.6%) has 0% recall on that class, i.e. it just learned
+to always predict "small is fine." Expected failure mode for a rare, imbalanced label, not a bug. Next step:
+more labeled data, or reframing as two separate per-model success predictions instead of one rare label.
+
 ## LLM-as-judge: summary faithfulness
 
 Execution accuracy (comparing result sets) is deterministic and doesn't need an LLM judge — a row either
