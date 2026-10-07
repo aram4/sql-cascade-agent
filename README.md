@@ -134,11 +134,17 @@ The English answer is a presentation layer only. Eval accuracy is measured by co
 - **BIRD benchmark** — evaluation dataset (SQLite databases + natural language questions)
 - **OpenTelemetry** — per-stage tracing (console exporter today; a vendor-neutral API means dropping in a
   real observability backend like Honeycomb or Arize later is an exporter swap, not a rewrite)
+- **Postgres** *(migration in progress)* — `src/pg_migrate.py` moves a BIRD SQLite database into a local
+  Postgres instance (schema translated, data copied, FKs applied as a second pass); `src/pg_dialect.py`
+  translates SQLite-flavored gold SQL (backtick identifiers, `LIMIT offset,count`) to run against it.
+  Validated so far: `california_schools` migrated, 10/11 of its gold queries execute cleanly against
+  Postgres (the one gap is a SQLite-implicit-typing case Postgres rejects, not a translation bug). The
+  agent's execution path still runs against SQLite/Modal — wiring it to Postgres is the next step.
 
 ## Quick start
 
 ```bash
-pip install modal langgraph langchain-fireworks python-dotenv opentelemetry-api opentelemetry-sdk
+pip install modal langgraph langchain-fireworks python-dotenv opentelemetry-api opentelemetry-sdk "psycopg[binary]"
 python3 -m modal setup
 
 # Add your Fireworks API key
