@@ -1,0 +1,9 @@
+name: 'sql_cascade_agent'
+version: '1.0.0'
+config-version: 2
+profile: 'sql_cascade_agent'
+
+model-paths: ["models"]
+clean-targets:
+  - "target"
+  - "dbt_packages"

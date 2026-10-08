@@ -4,3 +4,6 @@ __pycache__/
 data/
 *.db
 .modal/
+dbt/target/
+dbt/logs/
+dbt/.user.yml

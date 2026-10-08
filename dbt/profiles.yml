@@ -1,0 +1,12 @@
+sql_cascade_agent:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('PG_HOST') }}"
+      port: "{{ env_var('PG_PORT') | as_number }}"
+      user: "{{ env_var('PG_AGENT_USER') }}"
+      password: "{{ env_var('PG_AGENT_PASSWORD') }}"
+      dbname: "{{ env_var('PG_DBNAME') }}"
+      schema: public
+      threads: 4

@@ -131,6 +131,27 @@ LLM pipelines specifically (prompts/tokens as first-class fields via OpenInferen
 closer match for analyzing the generate/validate/summarize calls themselves. Either way, `agent.py` and
 `eval_bird.py` don't change.
 
+## Data quality (dbt)
+
+`dbt/` runs automated integrity tests against the Postgres-migrated BIRD databases — `not_null`, `unique`,
+and foreign-key `relationships` checks declared in `dbt/models/sources.yml` against the existing schemas
+as dbt **sources**, not as transformation models. Deliberately not the usual staging/marts dbt pattern:
+these schemas need to stay structurally faithful to BIRD's original tables for gold-SQL compatibility, so
+dbt's job here is checking data quality, not reshaping data.
+
+That distinction paid off immediately: `dbt test` catches real integrity gaps the migration script's FK
+pass already skips loudly rather than silently (see `pg_migrate.py`) — but dbt quantifies the actual scope.
+`satscores.cds → schools.cdscode` fails with **211 orphaned rows**, not the single instance spotted by eye
+during migration. That's the concrete value of a real testing framework over manual spot-checking.
+
+```bash
+cd dbt
+dbt test --profiles-dir .
+```
+
+Uses the same `agent_readonly` role as the agent itself — a tool that only ever checks data shouldn't need
+write access either. `profiles.yml` references connection details via `env_var()`, nothing hardcoded.
+
 ## Two modes, one graph
 
 The agent runs the same LangGraph pipeline in two modes:
@@ -155,17 +176,18 @@ The English answer is a presentation layer only. Eval accuracy is measured by co
 - **BIRD benchmark** — evaluation dataset (SQLite databases + natural language questions)
 - **OpenTelemetry** — per-stage tracing (console exporter today; a vendor-neutral API means dropping in a
   real observability backend like Honeycomb or Arize later is an exporter swap, not a rewrite)
-- **Postgres** *(migration in progress)* — `src/pg_migrate.py` moves a BIRD SQLite database into a local
-  Postgres instance (schema translated, data copied, FKs applied as a second pass); `src/pg_dialect.py`
-  translates SQLite-flavored gold SQL (backtick identifiers, `LIMIT offset,count`) to run against it.
-  Validated so far: `california_schools` migrated, 10/11 of its gold queries execute cleanly against
-  Postgres (the one gap is a SQLite-implicit-typing case Postgres rejects, not a translation bug). The
-  agent's execution path still runs against SQLite/Modal — wiring it to Postgres is the next step.
+- **Postgres** *(one database migrated so far — `california_schools`; 10 of 11 BIRD databases still
+  SQLite-only)* — `src/pg_migrate.py` moves a BIRD SQLite database into local Postgres (schema translated,
+  data copied, FKs applied as a second pass, read-only role granted for the agent); `src/pg_dialect.py`
+  adapts SQLite-flavored gold SQL to run against it. `agent.py`'s execution path runs against Postgres
+  when `pg_schema` is set on the agent state (see `_execute_sql_postgres`), SQLite/Modal otherwise.
+- **dbt** — data-quality tests (not transformation models) against the migrated Postgres schemas; see
+  Data quality (dbt) below
 
 ## Quick start
 
 ```bash
-pip install modal langgraph langchain-fireworks python-dotenv opentelemetry-api opentelemetry-sdk "psycopg[binary]"
+pip install modal langgraph langchain-fireworks python-dotenv opentelemetry-api opentelemetry-sdk "psycopg[binary]" scikit-learn joblib dbt-core dbt-postgres
 python3 -m modal setup
 
 # Add your Fireworks API key

@@ -1,0 +1,72 @@
+version: 2
+
+sources:
+  - name: sample
+    schema: sample
+    tables:
+      - name: departments
+        columns:
+          - name: dept_id
+            tests: [unique, not_null]
+      - name: employees
+        columns:
+          - name: emp_id
+            tests: [unique, not_null]
+          - name: dept_id
+            tests:
+              - relationships:
+                  arguments:
+                    to: source('sample', 'departments')
+                    field: dept_id
+      - name: projects
+        columns:
+          - name: project_id
+            tests: [unique, not_null]
+          - name: dept_id
+            tests:
+              - relationships:
+                  arguments:
+                    to: source('sample', 'departments')
+                    field: dept_id
+      - name: assignments
+        columns:
+          - name: emp_id
+            tests:
+              - relationships:
+                  arguments:
+                    to: source('sample', 'employees')
+                    field: emp_id
+          - name: project_id
+            tests:
+              - relationships:
+                  arguments:
+                    to: source('sample', 'projects')
+                    field: project_id
+
+  - name: california_schools
+    schema: california_schools
+    tables:
+      - name: schools
+        columns:
+          - name: cdscode
+            tests: [unique, not_null]
+      - name: frpm
+        columns:
+          - name: cdscode
+            tests:
+              - unique
+              - not_null
+              - relationships:
+                  arguments:
+                    to: source('california_schools', 'schools')
+                    field: cdscode
+      - name: satscores
+        columns:
+          - name: cds
+            tests:
+              - unique
+              - not_null
+              - relationships:
+                  arguments:
+                    to: source('california_schools', 'schools')
+                    field: cdscode
