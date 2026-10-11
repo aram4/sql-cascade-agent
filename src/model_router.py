@@ -106,6 +106,13 @@ def resolve_model(role: str, override: Optional[str] = None) -> ModelResolution:
     return ModelResolution(role=role, model=default, source="default")
 
 
+# A real BIRD eval run hit a single generate call that hung for 2965s (p99 latency
+# tracking is what surfaced it — p50/p95 looked completely normal). No timeout meant
+# nothing would ever fail it fast or trigger a retry; it just blocked indefinitely.
+# 90s is well above any legitimate single-call latency observed so far (worst real
+# case was ~35-50s) and far below that hang.
+REQUEST_TIMEOUT_SECONDS = 90
+
 _llm_cache: dict[tuple[str, str, int], ChatFireworks] = {}
 
 
@@ -127,6 +134,7 @@ def get_llm_for_role(
             api_key=os.environ["FIREWORKS_API_KEY"],
             temperature=0,
             max_tokens=tokens,
+            timeout=REQUEST_TIMEOUT_SECONDS,
         )
     return _llm_cache[cache_key], resolution
 

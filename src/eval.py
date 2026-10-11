@@ -107,7 +107,14 @@ def run_eval(db_path: str, questions: list[dict], use_sandbox: bool = False, mod
         if model:
             kwargs["model"] = model
 
-        agent_result = run_question(**kwargs)
+        try:
+            agent_result = run_question(**kwargs)
+        except Exception as e:
+            # A timeout or unparseable-output failure anywhere in the graph used to
+            # crash the whole eval run (this is exactly the class of bug that let a
+            # single hung call block indefinitely before REQUEST_TIMEOUT_SECONDS
+            # existed) — record it as a failed question instead, keep going.
+            agent_result = {"sql": "", "result": None, "error": str(e), "retries": 0, "answer": "", "trace": []}
         latency = time.time() - start
 
         gold_result = execute_gold_sql(db_path, q["gold_sql"])
