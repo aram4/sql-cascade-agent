@@ -167,6 +167,18 @@ The English answer is a presentation layer only. Eval accuracy is measured by co
 - **Temperature**: 0 (deterministic). Single pass per question, no k-run majority vote.
 - **Dataset**: targeting a 250-question stratified slice of BIRD dev set across difficulty levels. Current sample eval (n=15) is for harness validation only — not for model comparison claims.
 
+**Runs so far**, against the local 125-question BIRD slice unless noted:
+
+| Metric | Value | Note |
+|---|---|---|
+| Execution accuracy | 46–56% | Both models land in this range; identical reruns at temp=0 still swing ~10pts — real variance, not noise |
+| Summary faithfulness (`--judge-summary`) | 93.5–93.9% | Was 77.5% before fixing the `summarize`/`judge` truncation bug |
+| Latency p50 | 3–6s | |
+| Latency p95 | 13–17s | More trustworthy than p99 at current sample sizes |
+| Latency p99 | noisy at n=30–50 | Index falls within the top 1–2 points — close to just reporting the worst call, not a stable tail estimate |
+| Worst observed latency | 2965s (one call) | p50/p95 looked completely normal on that run; why a 90s request timeout now exists (`REQUEST_TIMEOUT_SECONDS` in `model_router.py`) |
+| Router classifier | not yet useful | Only 6/125 questions are positive examples — data-starved, honestly reported as such |
+
 ## Stack
 
 - **LangGraph** — agent orchestration with typed state and bounded retry loops
