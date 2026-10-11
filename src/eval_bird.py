@@ -12,7 +12,7 @@ load_dotenv()
 
 from src.agent import generate_sql_call, validate_sql_call, summarize_result_call, judge_summary_call, MAX_RETRIES
 from src.sandbox import get_runner, shutdown_sandbox
-from src.eval import results_match, summarize_routes
+from src.eval import results_match, summarize_routes, percentile
 from src.tracing import get_tracer
 
 tracer = get_tracer()
@@ -147,7 +147,8 @@ def run_bird_eval(questions: list[dict], model: str = None, judge_summary: bool 
         print(f"  [{i+1}/{total}] {status} ({latency:.1f}s){judge_tag} {db_id}: {q['question'][:50]}")
 
     accuracy = correct / total if total > 0 else 0
-    avg_latency = sum(r["latency_s"] for r in results) / total if total > 0 else 0
+    latencies = [r["latency_s"] for r in results]
+    avg_latency = sum(latencies) / total if total > 0 else 0
     retry_rate = sum(1 for r in results if r["retries"] > 0) / total if total > 0 else 0
 
     summary = {
@@ -156,6 +157,9 @@ def run_bird_eval(questions: list[dict], model: str = None, judge_summary: bool 
         "correct": correct,
         "total": total,
         "avg_latency_s": round(avg_latency, 2),
+        "p50_latency_s": round(percentile(latencies, 50), 2),
+        "p95_latency_s": round(percentile(latencies, 95), 2),
+        "p99_latency_s": round(percentile(latencies, 99), 2),
         "retry_rate": round(retry_rate, 4),
         "routes": summarize_routes(results),
         "results": results,
@@ -195,7 +199,8 @@ def main():
 
     print("-" * 60)
     print(f"Accuracy: {summary['accuracy']:.1%} ({summary['correct']}/{summary['total']})")
-    print(f"Avg latency: {summary['avg_latency_s']}s")
+    print(f"Latency: avg={summary['avg_latency_s']}s  p50={summary['p50_latency_s']}s  "
+          f"p95={summary['p95_latency_s']}s  p99={summary['p99_latency_s']}s")
     print(f"Retry rate: {summary['retry_rate']:.1%}")
     if judge_summary:
         rate = summary["faithfulness_rate"]
@@ -204,8 +209,11 @@ def main():
     print("\nRoutes:")
     for route in summary["routes"]:
         print(
-            f"  {route['role']:<10} {route['model']:<55} calls={route['calls']:<4} "
-            f"errors={route['errors']:<3} avg_latency={route['avg_latency_ms']}ms "
+            f"  {route['role']:<10} {route['model']:<55} calls={route['calls']:<4} errors={route['errors']:<3}"
+        )
+        print(
+            f"    latency(ms): avg={route['avg_latency_ms']:<8} p50={route['p50_latency_ms']:<8} "
+            f"p95={route['p95_latency_ms']:<8} p99={route['p99_latency_ms']:<8} max={route['max_latency_ms']:<8} "
             f"tokens_in={route['input_tokens']} tokens_out={route['output_tokens']}"
         )
 

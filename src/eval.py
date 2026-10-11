@@ -152,7 +152,8 @@ def run_eval(db_path: str, questions: list[dict], use_sandbox: bool = False, mod
         print(f"  [{i+1}/{total}] {status} ({latency:.1f}s){judge_tag} — {q['question'][:60]}")
 
     accuracy = correct / total if total > 0 else 0
-    avg_latency = sum(r["latency_s"] for r in results) / total if total > 0 else 0
+    latencies = [r["latency_s"] for r in results]
+    avg_latency = sum(latencies) / total if total > 0 else 0
     retry_rate = sum(1 for r in results if r["retries"] > 0) / total if total > 0 else 0
 
     summary = {
@@ -160,6 +161,9 @@ def run_eval(db_path: str, questions: list[dict], use_sandbox: bool = False, mod
         "correct": correct,
         "total": total,
         "avg_latency_s": round(avg_latency, 2),
+        "p50_latency_s": round(percentile(latencies, 50), 2),
+        "p95_latency_s": round(percentile(latencies, 95), 2),
+        "p99_latency_s": round(percentile(latencies, 99), 2),
         "retry_rate": round(retry_rate, 4),
         "routes": summarize_routes(results),
         "results": results,
@@ -170,9 +174,26 @@ def run_eval(db_path: str, questions: list[dict], use_sandbox: bool = False, mod
     return summary
 
 
+def percentile(values: list[float], pct: float) -> float:
+    """Linear-interpolation percentile (the same method numpy's default and
+    Excel's PERCENTILE.INC use). Works fine down to a single data point —
+    needed since some routes only have a handful of calls in a small eval run."""
+    if not values:
+        return 0.0
+    s = sorted(values)
+    k = (len(s) - 1) * (pct / 100)
+    f, c = int(k), min(int(k) + 1, len(s) - 1)
+    if f == c:
+        return s[f]
+    return s[f] + (s[c] - s[f]) * (k - f)
+
+
 def summarize_routes(results: list[dict]) -> list[dict]:
     """Roll up per-stage trace spans across all questions into per-(role, model) stats —
-    this is what "measure accuracy/cost per route" is computed from."""
+    this is what "measure accuracy/cost per route" is computed from. Tracks every call's
+    latency (not just a running sum) specifically so p50/p95/p99 can be computed, not just
+    a mean that hides tail latency — see the card_games Q39 outlier (150s+ on one call
+    while most take a few seconds) that an average alone would completely hide."""
     buckets: dict[tuple[str, str], dict] = {}
 
     for r in results:
@@ -182,25 +203,30 @@ def summarize_routes(results: list[dict]) -> list[dict]:
             key = (role, model)
             bucket = buckets.setdefault(key, {
                 "role": role, "model": model, "calls": 0, "errors": 0,
-                "total_latency_ms": 0.0, "input_tokens": 0, "output_tokens": 0,
+                "latencies_ms": [], "input_tokens": 0, "output_tokens": 0,
             })
             bucket["calls"] += 1
             if "error" in span:
                 bucket["errors"] += 1
                 continue
-            bucket["total_latency_ms"] += span.get("latency_ms") or 0
+            bucket["latencies_ms"].append(span.get("latency_ms") or 0)
             bucket["input_tokens"] += span.get("input_tokens") or 0
             bucket["output_tokens"] += span.get("output_tokens") or 0
 
     routes = []
     for (role, model), b in buckets.items():
         calls = b["calls"]
+        lat = b["latencies_ms"]
         routes.append({
             "role": role,
             "model": model,
             "calls": calls,
             "errors": b["errors"],
-            "avg_latency_ms": round(b["total_latency_ms"] / calls, 1) if calls else 0,
+            "avg_latency_ms": round(sum(lat) / len(lat), 1) if lat else 0,
+            "p50_latency_ms": round(percentile(lat, 50), 1),
+            "p95_latency_ms": round(percentile(lat, 95), 1),
+            "p99_latency_ms": round(percentile(lat, 99), 1),
+            "max_latency_ms": round(max(lat), 1) if lat else 0,
             "input_tokens": b["input_tokens"],
             "output_tokens": b["output_tokens"],
         })
@@ -238,7 +264,8 @@ def main():
 
     print("-" * 60)
     print(f"Accuracy: {summary['accuracy']:.1%} ({summary['correct']}/{summary['total']})")
-    print(f"Avg latency: {summary['avg_latency_s']}s")
+    print(f"Latency: avg={summary['avg_latency_s']}s  p50={summary['p50_latency_s']}s  "
+          f"p95={summary['p95_latency_s']}s  p99={summary['p99_latency_s']}s")
     print(f"Retry rate: {summary['retry_rate']:.1%}")
     if judge_summary:
         rate = summary["faithfulness_rate"]
@@ -247,8 +274,11 @@ def main():
     print("\nRoutes:")
     for route in summary["routes"]:
         print(
-            f"  {route['role']:<10} {route['model']:<55} calls={route['calls']:<4} "
-            f"errors={route['errors']:<3} avg_latency={route['avg_latency_ms']}ms "
+            f"  {route['role']:<10} {route['model']:<55} calls={route['calls']:<4} errors={route['errors']:<3}"
+        )
+        print(
+            f"    latency(ms): avg={route['avg_latency_ms']:<8} p50={route['p50_latency_ms']:<8} "
+            f"p95={route['p95_latency_ms']:<8} p99={route['p99_latency_ms']:<8} max={route['max_latency_ms']:<8} "
             f"tokens_in={route['input_tokens']} tokens_out={route['output_tokens']}"
         )
 
